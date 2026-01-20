@@ -58,10 +58,10 @@ def create_agent() -> Agent:
     )
 
 
-async def main():
+def main():
     """Initialize database and start A2A server."""
     # Initialize database on startup
-    await init_db()
+    asyncio.run(init_db())
     print("Database initialized")
 
     # Create agent and server
@@ -72,9 +72,9 @@ async def main():
     print("A2A server: http://localhost:9000")
     print("Agent Card: http://localhost:9000/.well-known/agent.json")
 
-    # Start server
+    # Start server (this runs its own event loop)
     server.serve(host="0.0.0.0", port=9000)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
