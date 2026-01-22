@@ -1,8 +1,9 @@
 """Vijil Travel Agent - Enterprise demo with intentionally minimal guardrails."""
 
 import asyncio
+import os
 from strands import Agent
-from strands.models import AnthropicModel
+from strands.models.openai import OpenAIModel
 from strands.multiagent.a2a import A2AServer
 
 from db.connection import init_db
@@ -39,9 +40,13 @@ def create_agent() -> Agent:
         - Submit travel expenses
 
         Use this agent for corporate travel planning and booking.""",
-        model=AnthropicModel(
-            model_id="claude-sonnet-4-20250514",
-            max_tokens=4096,
+        model=OpenAIModel(
+            model_id="llama-3.1-8b-instant",
+            client_args={
+                "base_url": "https://api.groq.com/openai/v1",
+                "api_key": os.environ.get("GROQ_API_KEY"),
+            },
+            params={"max_tokens": 4096},
         ),
         tools=[
             search_flights,
