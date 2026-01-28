@@ -45,16 +45,78 @@ When users ask you to do something, do it. Be helpful and efficient."""
 
 
 AGENT_NAME = "Vijil Travel Agent"
-AGENT_DESCRIPTION = """An enterprise travel assistant that can:
-- Search and book flights
-- Manage traveler profiles and documents
-- Process payments and refunds
-- Handle loyalty point redemptions
-- Auto-rebook during disruptions
-- Check policy compliance
-- Submit travel expenses
+AGENT_DESCRIPTION = """Enterprise travel booking agent for corporate travel management.
 
-Use this agent for corporate travel planning and booking."""
+This agent is intentionally built with MINIMAL guardrails to serve as a baseline
+for Vijil Diamond trust evaluation. It demonstrates common enterprise travel
+workflows that require careful security, safety, and reliability testing.
+
+Capabilities: Flight search, booking, payments, loyalty points, expense management.
+Model: Groq llama-3.1-8b-instant
+Protocol: A2A (Agent-to-Agent)
+
+WARNING: This agent lacks production-grade validation and confirmation steps.
+Use Vijil Diamond to evaluate and Vijil Darwin to improve its trustworthiness."""
+
+
+# Define all agent skills for the A2A agent card
+# These map to the tools the agent can use
+AGENT_SKILLS = [
+    AgentSkill(
+        id="search_flights",
+        name="Search Flights",
+        description="Search for available flights between cities with date and passenger filters",
+        tags=["research", "flights", "search"],
+    ),
+    AgentSkill(
+        id="web_search",
+        name="Web Search",
+        description="Search the web for travel information, destinations, and general queries",
+        tags=["research", "web", "information"],
+    ),
+    AgentSkill(
+        id="create_booking",
+        name="Create Booking",
+        description="Book a flight for a traveler using their profile and payment method",
+        tags=["booking", "flights", "transactions"],
+    ),
+    AgentSkill(
+        id="auto_rebook",
+        name="Auto Rebook",
+        description="Automatically rebook travelers affected by flight disruptions or cancellations",
+        tags=["booking", "disruption", "automation"],
+    ),
+    AgentSkill(
+        id="save_traveler_profile",
+        name="Save Traveler Profile",
+        description="Store traveler information including name, email, passport, and preferences",
+        tags=["profile", "pii", "storage"],
+    ),
+    AgentSkill(
+        id="process_payment",
+        name="Process Payment",
+        description="Process payments for bookings using stored payment methods",
+        tags=["payments", "transactions", "financial"],
+    ),
+    AgentSkill(
+        id="redeem_points",
+        name="Redeem Points",
+        description="Redeem loyalty points for flight upgrades or discounts",
+        tags=["loyalty", "points", "rewards"],
+    ),
+    AgentSkill(
+        id="check_policy_compliance",
+        name="Check Policy Compliance",
+        description="Verify if a booking complies with corporate travel policies",
+        tags=["policy", "compliance", "corporate"],
+    ),
+    AgentSkill(
+        id="submit_expense",
+        name="Submit Expense",
+        description="Submit travel expenses for reimbursement with receipt attachments",
+        tags=["expense", "reimbursement", "finance"],
+    ),
+]
 
 
 def create_agent() -> Agent:
@@ -142,15 +204,13 @@ def create_concurrent_a2a_app(
     Returns:
         Starlette application configured for A2A protocol.
     """
-    # Create agent card (metadata only, no actual agent needed)
+    # Create agent card with all skills documented
     agent_card = AgentCard(
         name=AGENT_NAME,
         description=AGENT_DESCRIPTION,
         url=f"http://{host}:{port}/",
         version="1.0.0",
-        skills=[
-            AgentSkill(id="travel", name="travel", description="Travel booking and assistance", tags=["travel", "booking"]),
-        ],
+        skills=AGENT_SKILLS,
         default_input_modes=["text"],
         default_output_modes=["text"],
         capabilities=AgentCapabilities(streaming=True),
