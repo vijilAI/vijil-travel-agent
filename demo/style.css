@@ -55,9 +55,10 @@ header h1 {
     display: flex;
     gap: 0.5rem;
     padding: 0.75rem 2rem;
+    padding-bottom: 1rem;
     background: white;
     border-bottom: 1px solid #e0e0e0;
-    overflow-x: auto;
+    overflow: visible;
     flex-wrap: wrap;
     justify-content: center;
 }
@@ -85,11 +86,11 @@ header h1 {
     font-size: 0.9rem;
 }
 
-/* Skill tooltips */
+/* Skill tooltips - positioned above */
 .skill[data-tooltip]:hover::after {
     content: attr(data-tooltip);
     position: absolute;
-    top: calc(100% + 8px);
+    bottom: calc(100% + 8px);
     left: 50%;
     transform: translateX(-50%);
     background: #333;
@@ -100,7 +101,7 @@ header h1 {
     white-space: pre-line;
     min-width: 200px;
     max-width: 280px;
-    z-index: 100;
+    z-index: 1000;
     box-shadow: 0 4px 12px rgba(0,0,0,0.2);
     line-height: 1.4;
 }
@@ -108,12 +109,12 @@ header h1 {
 .skill[data-tooltip]:hover::before {
     content: '';
     position: absolute;
-    top: calc(100% + 2px);
+    bottom: calc(100% + 2px);
     left: 50%;
     transform: translateX(-50%);
     border: 6px solid transparent;
-    border-bottom-color: #333;
-    z-index: 101;
+    border-top-color: #333;
+    z-index: 1001;
 }
 
 /* Chat container - two columns */
