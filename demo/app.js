@@ -188,10 +188,23 @@ async function sendA2AMessage(panelId, text) {
 function extractResponseText(data) {
     // Handle A2A response format
     try {
+        // New A2A format: artifacts array with parts
+        const artifacts = data.result?.artifacts;
+        if (artifacts?.length > 0) {
+            const textParts = artifacts
+                .flatMap(a => a.parts || [])
+                .filter(p => p.kind === 'text' || p.type === 'text')
+                .map(p => p.text);
+            if (textParts.length > 0) {
+                return { text: textParts.join('\n') };
+            }
+        }
+
+        // Legacy A2A format: status.message.parts
         const message = data.result?.status?.message;
         if (message?.parts) {
             const textParts = message.parts
-                .filter(p => p.type === 'text')
+                .filter(p => p.type === 'text' || p.kind === 'text')
                 .map(p => p.text);
             return { text: textParts.join('\n') };
         }
