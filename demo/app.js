@@ -373,6 +373,19 @@ function setupEventListeners() {
             saveSettings();
         }
     });
+
+    // Tab switching for prompt panels
+    document.querySelectorAll('.prompt-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            // Remove active from all tabs and panels
+            document.querySelectorAll('.prompt-tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.prompt-panel').forEach(p => p.classList.remove('active'));
+
+            // Add active to clicked tab and corresponding panel
+            tab.classList.add('active');
+            document.getElementById(`tab-${tab.dataset.tab}`).classList.add('active');
+        });
+    });
 }
 
 // =============================================================================
