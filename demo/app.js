@@ -152,11 +152,13 @@ function preloadConversation() {
 async function sendA2AMessage(panelId, text) {
     const panel = state[panelId];
 
+    const messageId = crypto.randomUUID();
     const payload = {
         jsonrpc: '2.0',
         method: 'message/send',
         params: {
             message: {
+                messageId: messageId,
                 role: 'user',
                 parts: [{ type: 'text', text }]
             }
