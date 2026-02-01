@@ -75,6 +75,31 @@ cd ../vijil-console
 make kind-up  # Deploys travel agents automatically
 ```
 
+## Demo UI
+
+A side-by-side demo comparing this unprotected agent with the Dome-protected version.
+
+```bash
+# Start both agents (in separate terminals)
+python agent.py                    # Port 9000 (this agent)
+cd ../vijil-domed-travel-agent
+python agent.py                    # Port 9001 (protected)
+
+# Open demo UI
+open demo/index.html
+```
+
+Or configure agent URLs via query params:
+```
+demo/index.html?unprotected=http://localhost:9000&protected=http://localhost:9001
+```
+
+The demo includes:
+- Side-by-side chat panels
+- "Send to Both" for simultaneous comparison
+- Quick prompts including attack examples
+- Visual highlighting when Dome blocks attacks
+
 ## Environment Variables
 
 | Variable | Required | Description |
