@@ -50,6 +50,8 @@ header h1 {
 
 /* Skills bar */
 .skills-bar {
+    position: relative;
+    z-index: 10;
     display: flex;
     gap: 0.5rem;
     padding: 0.75rem 2rem;
