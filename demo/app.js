@@ -8,13 +8,17 @@
 
 const state = {
     unprotected: {
-        url: 'http://localhost:9000',
+        // Default to same-origin relative path (works when served from nginx at /demo/)
+        // Override via URL params: ?unprotected=http://localhost:9000
+        url: '/a2a/travel-agent',
         messages: [],
         trust: null,
         loading: false
     },
     protected: {
-        url: 'http://localhost:9001',
+        // Default to same-origin relative path (works when served from nginx at /demo/)
+        // Override via URL params: ?protected=http://localhost:9001
+        url: '/a2a/domed-travel-agent',
         messages: [],
         trust: null,
         loading: false

@@ -34,15 +34,25 @@ The `demo/` folder contains a browser-based comparison UI that sends the same pr
 
 ### Running the Demo UI
 
+**Preferred method (served by nginx - no separate server needed):**
 ```bash
-# 1. Start HTTP server for the UI
-cd demo && python3 -m http.server 8080
+# 1. Deploy travel agents and demo (from vijil-console)
+cd /Users/ciphr/Code/Vijil/vijil-console
+make kind-deploy-travel-agents
 
-# 2. Port-forward agents (if running in Kind cluster)
+# 2. Open http://localhost:8000/demo/
+#    Everything is served from the same origin - no CORS issues!
+```
+
+**Alternative (standalone with Python HTTP server):**
+```bash
+# Use URL params to override endpoints
+cd demo && python3 -m http.server 8080
+# Open http://localhost:8080?unprotected=http://localhost:9000&protected=http://localhost:9001
+
+# Start port-forwards in background
 kubectl port-forward -n vijil-console deploy/vijil-travel-agent 9000:9000 &
 kubectl port-forward -n vijil-console deploy/vijil-domed-travel-agent 9001:9000 &
-
-# 3. Open http://localhost:8080
 ```
 
 ### UI Features
@@ -82,15 +92,14 @@ python agent.py  # Runs on port 9000
 ```bash
 cd /Users/ciphr/Code/Vijil/vijil-console
 
-# Build and deploy
-docker build -t vijil-travel-agent:kind -f ../vijil-travel-agent/Dockerfile ../vijil-travel-agent
-kind load docker-image vijil-travel-agent:kind --name vijil-console
-kubectl apply -f ../vijil-travel-agent/k8s/
+# Full deploy (build, load, restart, demo)
+make kind-deploy-travel-agents
 
-# Same for domed variant
-docker build -t vijil-domed-travel-agent:kind -f ../vijil-domed-travel-agent/Dockerfile ../vijil-domed-travel-agent
-kind load docker-image vijil-domed-travel-agent:kind --name vijil-console
-kubectl apply -f ../vijil-domed-travel-agent/k8s/
+# Individual steps (if needed)
+make kind-build-travel-agents    # Build Docker images with git SHA tags
+make kind-load-travel-agents     # Load images into Kind cluster
+make kind-restart-travel-agents  # Restart deployments with new images
+make kind-deploy-travel-demo     # Deploy demo UI ConfigMap
 ```
 
 ## Related Repos
