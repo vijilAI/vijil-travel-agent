@@ -7,7 +7,9 @@ per request, avoiding the Strands SDK's single-threaded agent limitation.
 import asyncio
 import logging
 import os
+import time
 from typing import Any, Callable
+from uuid import uuid4
 
 from strands import Agent
 from strands.models.openai import OpenAIModel
@@ -287,6 +289,60 @@ def create_concurrent_a2a_app(
     return app
 
 
+# =============================================================================
+# OpenAI-Compatible Chat Completions Endpoint
+# =============================================================================
+
+def add_chat_completions_endpoint(app: Any) -> None:
+    """Register /v1/chat/completions on the Starlette app.
+
+    This enables redteam tools (Diamond, Promptfoo, Garak, PyRIT) to target
+    this A2A agent using the standard OpenAI chat completions protocol.
+    """
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+
+    async def chat_completions(request: Request) -> JSONResponse:
+        body = await request.json()
+        messages = body.get("messages", [])
+        model = body.get("model", "llama-3.1-8b-instant")
+
+        # Extract last user message
+        user_messages = [m for m in messages if m.get("role") == "user"]
+        if not user_messages:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "No user message found"},
+            )
+        user_text = user_messages[-1]["content"]
+
+        # Run Strands agent (synchronous) in thread pool
+        try:
+            agent = create_agent()
+            result = await asyncio.to_thread(agent, user_text)
+            response_text = str(result)
+        except Exception as e:
+            logger.warning(f"Agent execution failed in chat completions: {e}")
+            response_text = ConcurrentA2AExecutor.ERROR_MESSAGE
+
+        return JSONResponse(content={
+            "id": f"chatcmpl-{uuid4().hex[:24]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": response_text},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        })
+
+    app.routes.append(Route("/v1/chat/completions", chat_completions, methods=["POST"]))
+    logger.info("Chat completions endpoint registered at /v1/chat/completions")
+
+
 def main():
     """Initialize database and start concurrent A2A server."""
     # Initialize database on startup
@@ -299,13 +355,17 @@ def main():
     print(f"\n{'='*60}")
     print("Vijil Travel Agent - Concurrent A2A Server")
     print(f"{'='*60}")
-    print(f"A2A server: http://localhost:{port}")
+    print(f"A2A Server: http://localhost:{port}")
+    print(f"Chat API:   http://localhost:{port}/v1/chat/completions")
     print(f"Agent Card: http://localhost:{port}/.well-known/agent.json")
     print(f"Concurrency: ENABLED (fresh agent per request)")
     print(f"{'='*60}\n")
 
     # Create app with concurrent support
     app = create_concurrent_a2a_app(create_agent, host, port)
+
+    # Register OpenAI-compatible chat completions endpoint for redteam tools
+    add_chat_completions_endpoint(app)
 
     # Run with uvicorn
     uvicorn.run(app, host=host, port=port)
