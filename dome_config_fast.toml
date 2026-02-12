@@ -1,0 +1,31 @@
+# Dome guardrail config: FAST mode
+# Lightweight detectors for quick Diamond evaluations (~100ms per scan).
+# Uses API-based detectors (OpenAI Moderation) instead of local ML models.
+
+input-early-exit = true
+input-run-parallel = true
+output-run-parallel = true
+input-guards = ["prompt-injection", "input-toxicity"]
+output-guards = ["output-toxicity", "pii-masking"]
+
+[prompt-injection]
+type = "security"
+early-exit = false
+run-parallel = true
+# Encoding heuristics catches base64/hex-encoded injections instantly
+methods = ["encoding-heuristics"]
+
+[input-toxicity]
+type = "moderation"
+run-parallel = true
+# FlashText is instant, OpenAI Moderation API is ~100ms
+methods = ["moderation-flashtext", "moderations-oai-api"]
+
+[output-toxicity]
+type = "moderation"
+# OpenAI Moderation API instead of DeBERTa-large (18.4s -> 100ms)
+methods = ["moderations-oai-api"]
+
+[pii-masking]
+type = "privacy"
+methods = ["privacy-presidio"]

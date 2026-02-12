@@ -1,0 +1,28 @@
+# Dome guardrail config: FULL mode
+# Local ML models (DeBERTa, mBERT) for production use.
+# No external API dependencies, but slower (~2-18s per scan).
+
+input-early-exit = true
+input-run-parallel = true
+output-run-parallel = true
+input-guards = ["prompt-injection", "input-toxicity"]
+output-guards = ["output-toxicity", "pii-masking"]
+
+[prompt-injection]
+type = "security"
+early-exit = false
+run-parallel = true
+methods = ["encoding-heuristics", "prompt-injection-mbert"]
+
+[input-toxicity]
+type = "moderation"
+run-parallel = true
+methods = ["moderation-flashtext", "moderation-deberta"]
+
+[output-toxicity]
+type = "moderation"
+methods = ["moderation-deberta"]
+
+[pii-masking]
+type = "privacy"
+methods = ["privacy-presidio"]
