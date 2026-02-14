@@ -320,11 +320,18 @@ class ConcurrentA2AExecutor(AgentExecutor):
 # Agent Factory
 # =============================================================================
 
+# Set by main() after Dome initialization; consumed by create_agent().
+_dome_hooks: list | None = None
+
+
 def create_agent() -> Agent:
     """Create a fresh travel agent with all tools.
 
     System prompt is loaded dynamically from genome file (if GENOME_PATH set),
     enabling hot-reload of Darwin mutations without agent restart.
+
+    When Dome is enabled, _dome_hooks is set at startup and every agent
+    instance receives the DomeHookProvider for framework-level guarding.
     """
     genome = None
     genome_path = os.environ.get("GENOME_PATH")
@@ -360,6 +367,7 @@ def create_agent() -> Agent:
             submit_expense,
         ],
         system_prompt=current_prompt,
+        hooks=_dome_hooks,
     )
 
 
@@ -414,16 +422,15 @@ def _chat_response(content: str, model: str = "llama-3.1-8b-instant") -> JSONRes
     })
 
 
-def add_chat_completions_endpoint(app: Any, dome: Any = None) -> None:
+def add_chat_completions_endpoint(app: Any) -> None:
     """Register /v1/chat/completions on the FastAPI app.
 
     This enables redteam tools (Diamond, Promptfoo, Garak, PyRIT) to target
     this agent using the standard OpenAI chat completions protocol.
 
-    Dome guards are applied directly in the handler (DomeA2AMiddleware only
-    handles A2A JSON-RPC format, so chat completions needs its own guard calls).
+    Dome guards are applied at the framework level via DomeHookProvider hooks
+    inside the Strands Agent — no manual guard calls needed here.
     """
-    from dome_a2a import DEFAULT_BLOCKED_MESSAGE as _DOME_BLOCKED_MESSAGE
     from pydantic import BaseModel
 
     class ChatMessage(BaseModel):
@@ -443,20 +450,7 @@ def add_chat_completions_endpoint(app: Any, dome: Any = None) -> None:
             return JSONResponse(status_code=400, content={"error": "No user message found"})
         user_text = user_messages[-1].content
 
-        # Dome input guard
-        if dome:
-            scan = await dome.input_guardrail.async_scan(
-                user_text,
-                agent_id=AGENT_ID,
-                team_id=os.environ.get("TEAM_ID"),
-            )
-            if scan.flagged:
-                return _chat_response(
-                    _DOME_BLOCKED_MESSAGE,
-                    model=request.model,
-                )
-
-        # Run Strands agent in thread pool
+        # Run Strands agent in thread pool (Dome hooks guard input/output inside Agent)
         try:
             agent = create_agent()
             result = await asyncio.to_thread(agent, user_text)
@@ -464,16 +458,6 @@ def add_chat_completions_endpoint(app: Any, dome: Any = None) -> None:
         except Exception as e:
             logger.warning(f"Agent execution failed in chat completions: {e}")
             response_text = ConcurrentA2AExecutor.ERROR_MESSAGE
-
-        # Dome output guard
-        if dome:
-            out_scan = await dome.output_guardrail.async_scan(
-                response_text,
-                agent_id=AGENT_ID,
-                team_id=os.environ.get("TEAM_ID"),
-            )
-            if out_scan.flagged:
-                response_text = _DOME_BLOCKED_MESSAGE
 
         return _chat_response(response_text, model=request.model)
 
@@ -558,7 +542,6 @@ def main():
             logger.warning(f"Failed to load startup genome: {e}")
 
     # Initialize Dome if enabled
-    dome = None
     dome_active = False
     team_id = os.environ.get("TEAM_ID")
 
@@ -566,6 +549,7 @@ def main():
         effective_dome_config = get_effective_dome_config(startup_genome)
         try:
             from vijil_dome import Dome
+            from vijil_dome.integrations.strands import DomeHookProvider
             dome = Dome(effective_dome_config)
 
             # Unified instrumentation: split metrics + Darwin detection spans
@@ -577,18 +561,19 @@ def main():
                 except Exception as e:
                     logger.warning(f"Failed to instrument Dome: {e}")
 
-            from dome_a2a import DomeA2AMiddleware
-            app.add_middleware(DomeA2AMiddleware, dome=dome, agent_id=AGENT_ID, team_id=team_id)
+            # Framework-level guarding: every Agent instance gets this hook
+            global _dome_hooks
+            _dome_hooks = [DomeHookProvider(dome, agent_id=AGENT_ID, team_id=team_id)]
             dome_active = True
-            logger.info("Dome guardrails ENABLED")
+            logger.info("Dome guardrails ENABLED (DomeHookProvider)")
 
             _notify_console_dome_active()
 
         except ImportError:
-            logger.error("DOME_ENABLED=1 but vijil-dome not installed!")
+            logger.error("DOME_ENABLED=1 but vijil-dome or strands-agents not installed!")
 
-    # Register chat completions endpoint (with dome guards if active)
-    add_chat_completions_endpoint(app, dome=dome if dome_active else None)
+    # Register chat completions endpoint
+    add_chat_completions_endpoint(app)
 
     # Add CORS middleware AFTER Dome (LIFO order means CORS runs first)
     app.add_middleware(
