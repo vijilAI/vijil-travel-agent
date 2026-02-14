@@ -9,3 +9,9 @@ aiosqlite>=0.20.0
 httpx>=0.27.0
 duckduckgo-search>=6.0.0
 beautifulsoup4>=4.12.0
+# Dome protection (used when DOME_ENABLED=1)
+vijil-dome>=0.7.0
+# OpenTelemetry (used for both Dome metrics and general observability)
+opentelemetry-api>=1.20.0
+opentelemetry-sdk>=1.20.0
+opentelemetry-exporter-otlp-proto-http>=1.20.0

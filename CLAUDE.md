@@ -9,7 +9,7 @@ Demo travel agent for testing Vijil evaluation and protection systems.
 This is a simple travel booking agent used to:
 - Demonstrate Diamond evaluation capabilities
 - Test security probes and safety harnesses
-- Validate Dome protection guardrails (via vijil-domed-travel-agent)
+- Validate Dome protection guardrails (set DOME_ENABLED=1)
 
 ## Repository Structure
 
@@ -30,7 +30,7 @@ vijil-travel-agent/
 
 The `demo/` folder contains a browser-based comparison UI that sends the same prompts to both:
 - **Unprotected agent** (vijil-travel-agent) on port 9000
-- **Protected agent** (vijil-domed-travel-agent with Dome) on port 9001
+- **Protected agent** (same image with DOME_ENABLED=1) on port 9001
 
 ### Running the Demo UI
 
@@ -106,7 +106,6 @@ make kind-deploy-travel-demo     # Deploy demo UI ConfigMap
 
 | Repo | Purpose |
 |------|---------|
-| `vijil-domed-travel-agent` | Same agent with Dome protection layer |
 | `vijil-dome` | The protection/guardrails service |
 | `vijil-console` | Platform backend, Kind cluster setup |
 

@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vijil-domed-travel-agent
+  namespace: vijil-console
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vijil-domed-travel-agent
+  template:
+    metadata:
+      labels:
+        app: vijil-domed-travel-agent
+    spec:
+      containers:
+      - name: agent
+        image: vijil-travel-agent:kind
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 9000
+        env:
+        # Feature toggle: enables Dome protection
+        - name: DOME_ENABLED
+          value: "1"
+        - name: GROQ_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: vijil-secrets
+              key: GROQ_API_KEY
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: vijil-secrets
+              key: OPENAI_API_KEY
+        - name: DOME_FAST_MODE
+          value: "1"
+        # OpenTelemetry: emits split metrics and Darwin detection spans
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: "http://otel-collector.vijil-telemetry.svc.cluster.local:4318"
+        - name: OTEL_SERVICE_NAME
+          value: "vijil-domed-travel-agent"
+        # Darwin integration: agent and team identity
+        - name: VIJIL_AGENT_ID
+          value: "b7764389-ee2a-40f0-8436-bf754f818ef3"
+        - name: TEAM_ID
+          value: "7295f905-194b-42a8-95e2-0ff69bd6ceb9"
+        - name: OTEL_RESOURCE_ATTRIBUTES
+          value: "agent.id=b7764389-ee2a-40f0-8436-bf754f818ef3,team.id=7295f905-194b-42a8-95e2-0ff69bd6ceb9"
+        # Console writeback: sets protection_status to "domed" at startup.
+        # Set both to enable — omit to skip writeback silently.
+        #- name: VIJIL_CONSOLE_URL
+        #  value: ""
+        #- name: VIJIL_API_KEY
+        #  value: ""
+        resources:
+          # Higher resources for parallel Dome guard execution
+          # ML models (MBERT, DeBERTa, spaCy) run concurrently
+          requests:
+            memory: "2Gi"
+            cpu: "500m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        # Health probes using A2A discovery endpoint
+        # Longer initial delay for Dome's ML model loading
+        livenessProbe:
+          httpGet:
+            path: /.well-known/agent.json
+            port: 9000
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /.well-known/agent.json
+            port: 9000
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vijil-domed-travel-agent
+  namespace: vijil-console
+spec:
+  selector:
+    app: vijil-domed-travel-agent
+  ports:
+  - port: 9000
+    targetPort: 9000
