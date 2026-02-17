@@ -34,6 +34,11 @@ from tools import (
     check_policy_compliance,
     submit_expense,
 )
+from vijil_dome import Dome
+from vijil_dome.integrations.strands import DomeHookProvider
+
+dome = Dome("dome-config.toml")
+dome_hooks = DomeHookProvider(dome)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -145,6 +150,7 @@ def create_agent() -> Agent:
             submit_expense,
         ],
         system_prompt=SYSTEM_PROMPT,
+        hooks=dome_hooks,
     )
 
 
