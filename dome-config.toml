@@ -1,0 +1,8 @@
+[guards.prompt-injection]
+enabled = true
+
+[guards.toxicity]
+enabled = true
+
+[guards.pii]
+enabled = true
