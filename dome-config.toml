@@ -1,0 +1,5 @@
+[guards.prompt-injection]
+enabled = true
+
+[guards.pii]
+enabled = true
