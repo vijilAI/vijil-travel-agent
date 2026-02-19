@@ -126,6 +126,7 @@ class GenomeLoader:
 
     def _load_genome(self) -> GenomeMutation:
         """Load genome from file."""
+        assert self.genome_path is not None  # Caller checks before calling
         try:
             with open(self.genome_path, "r") as f:
                 data = json.load(f)

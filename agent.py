@@ -14,7 +14,6 @@ Telemetry Integration:
 """
 
 import asyncio
-import json
 import logging
 import os
 import time
@@ -279,7 +278,7 @@ class ConcurrentA2AExecutor(AgentExecutor):
         event_queue: EventQueue,
     ) -> None:
         """Execute request with a fresh agent instance."""
-        from a2a.types import Message, TextPart, TaskStatus, TaskState, TaskStatusUpdateEvent
+        from a2a.types import Message, Part, TextPart, Role, TaskStatus, TaskState, TaskStatusUpdateEvent
 
         agent = self.agent_factory()
         logger.debug(f"Created fresh agent for request: {id(agent)}")
@@ -292,15 +291,15 @@ class ConcurrentA2AExecutor(AgentExecutor):
 
             error_message = Message(
                 message_id=str(uuid4()),
-                role="agent",
-                parts=[TextPart(kind="text", text=self.ERROR_MESSAGE)],
-                task_id=context.task_id,
-                context_id=context.context_id,
+                role=Role.agent,
+                parts=[Part(root=TextPart(kind="text", text=self.ERROR_MESSAGE))],
+                task_id=context.task_id or "",
+                context_id=context.context_id or "",
             )
             status_event = TaskStatusUpdateEvent(
                 kind="status-update",
-                task_id=context.task_id,
-                context_id=context.context_id,
+                task_id=context.task_id or "",
+                context_id=context.context_id or "",
                 final=True,
                 status=TaskStatus(
                     state=TaskState.completed,
@@ -324,7 +323,7 @@ class ConcurrentA2AExecutor(AgentExecutor):
 _dome_hooks: list | None = None
 
 
-def create_agent() -> Agent:
+def create_agent(messages=None) -> Agent:
     """Create a fresh travel agent with all tools.
 
     System prompt is loaded dynamically from genome file (if GENOME_PATH set),
@@ -332,6 +331,11 @@ def create_agent() -> Agent:
 
     When Dome is enabled, _dome_hooks is set at startup and every agent
     instance receives the DomeHookProvider for framework-level guarding.
+
+    Args:
+        messages: Optional prior conversation history in Strands format.
+                  Each message is {"role": "user"|"assistant", "content": [{"text": "..."}]}.
+                  Used by the chat completions endpoint for multi-turn context.
     """
     genome = None
     genome_path = os.environ.get("GENOME_PATH")
@@ -368,6 +372,7 @@ def create_agent() -> Agent:
         ],
         system_prompt=current_prompt,
         hooks=_dome_hooks,
+        messages=messages,
     )
 
 
@@ -422,11 +427,30 @@ def _chat_response(content: str, model: str = "llama-3.1-8b-instant") -> JSONRes
     })
 
 
+def _openai_to_strands_messages(messages: list) -> list[dict]:
+    """Convert OpenAI-format messages to Strands message format.
+
+    Skips system messages (handled by Agent's system_prompt parameter).
+    Maps user/assistant text content to Strands ContentBlock format.
+    """
+    strands_msgs = []
+    for m in messages:
+        if m.role in ("user", "assistant"):
+            strands_msgs.append({
+                "role": m.role,
+                "content": [{"text": m.content}],
+            })
+    return strands_msgs
+
+
 def add_chat_completions_endpoint(app: Any) -> None:
     """Register /v1/chat/completions on the FastAPI app.
 
     This enables redteam tools (Diamond, Promptfoo, Garak, PyRIT) to target
     this agent using the standard OpenAI chat completions protocol.
+
+    Supports multi-turn conversations: all prior messages are converted to
+    Strands format and passed as conversation history to the Agent constructor.
 
     Dome guards are applied at the framework level via DomeHookProvider hooks
     inside the Strands Agent — no manual guard calls needed here.
@@ -445,14 +469,24 @@ def add_chat_completions_endpoint(app: Any) -> None:
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: ChatCompletionRequest):
-        user_messages = [m for m in request.messages if m.role == "user"]
-        if not user_messages:
+        # Find the last user message — that's the new query
+        last_user_idx = None
+        for i in range(len(request.messages) - 1, -1, -1):
+            if request.messages[i].role == "user":
+                last_user_idx = i
+                break
+
+        if last_user_idx is None:
             return JSONResponse(status_code=400, content={"error": "No user message found"})
-        user_text = user_messages[-1].content
+
+        user_text = request.messages[last_user_idx].content
+
+        # Everything before the last user message is conversation history
+        history = _openai_to_strands_messages(request.messages[:last_user_idx])
 
         # Run Strands agent in thread pool (Dome hooks guard input/output inside Agent)
         try:
-            agent = create_agent()
+            agent = create_agent(messages=history if history else None)
             result = await asyncio.to_thread(agent, user_text)
             response_text = str(result)
         except Exception as e:
@@ -596,7 +630,7 @@ def main():
     print(f"A2A Server: http://localhost:{port}")
     print(f"Chat API:   http://localhost:{port}/v1/chat/completions")
     print(f"Agent Card: http://localhost:{port}/.well-known/agent.json")
-    print(f"Concurrency: ENABLED (fresh agent per request)")
+    print("Concurrency: ENABLED (fresh agent per request)")
     print("-" * 60)
 
     if genome_path:
@@ -608,7 +642,7 @@ def main():
             if DOME_ENABLED:
                 print(f"  Dome:     {'OVERRIDE' if startup_genome.dome_config else 'default'}")
         else:
-            print(f"  Status:   NOT LOADED (using defaults)")
+            print("  Status:   NOT LOADED (using defaults)")
         print("-" * 60)
 
     print(f"Dome:          {'ENABLED' if dome_active else 'DISABLED'}")
