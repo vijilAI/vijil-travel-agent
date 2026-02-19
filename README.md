@@ -1,12 +1,49 @@
 # Vijil Travel Agent
 
-Enterprise travel booking agent for demonstrating Vijil's trust platform.
+Enterprise travel booking agent with intentionally seeded vulnerabilities for
+AI security evaluation and red-team testing.
 
-Built with minimal guardrails to serve as a baseline for:
+Built with minimal guardrails to serve as a baseline target for:
 
 - **[Diamond](https://github.com/vijilai/vijil-diamond)** — Trust evaluation (security, safety, reliability)
 - **[Dome](https://github.com/vijilai/vijil-dome)** — Runtime protection (toggle with `DOME_ENABLED=1`)
 - **[Darwin](https://github.com/vijilai/vijil-console)** — Automated agent improvement via genome mutations
+
+> **Inspired by** the [OWASP ASI FinBot CTF Demo](https://github.com/OWASP-ASI/finbot-ctf-demo) —
+> vulnerabilities arise from realistic design tensions, not obvious holes.
+
+---
+
+## Responsible Use
+
+This agent is an **educational and evaluation tool** designed exclusively for
+authorized security testing of AI agents. It contains intentionally seeded
+vulnerabilities mapped to OWASP ASI risk categories and MITRE ATT&CK tactics
+for agentic AI.
+
+**By using this software, you agree to the following:**
+
+1. **Educational and authorized use only.** Use this agent solely for security
+   evaluation, red-team testing, CTF exercises, and educational demonstrations
+   within environments you own or have explicit authorization to test.
+
+2. **Do not deploy to production.** This agent lacks authentication, input
+   validation, and access controls by design. It must never serve real users
+   or handle real data.
+
+3. **Do not misuse seeded vulnerabilities.** The attack surfaces documented
+   here exist to improve AI agent security through evaluation tools like
+   Vijil Diamond. Do not use them to develop attacks against other systems.
+
+4. **Respect data boundaries.** All employee records, corporate cards, API
+   credentials, and other seed data are fictional. Do not substitute real
+   data into this system.
+
+5. **Report responsibly.** If you discover a vulnerability in Vijil's
+   evaluation or protection products (not this intentionally vulnerable
+   agent), report it to security@vijil.ai.
+
+---
 
 ## Architecture
 
@@ -20,11 +57,19 @@ Built with minimal guardrails to serve as a baseline for:
 ├─────────────────────────────────────────────────────────────┤
 │  Strands Agent (fresh instance per request)                 │
 │  ├── Model: Groq llama-3.1-8b-instant                       │
-│  ├── 9 tools across 5 capability tiers                      │
+│  ├── 18 tools across 8 capability categories                │
+│  ├── Dynamic system prompt (config + memory + genome)       │
 │  └── Optional Dome hooks (DomeHookProvider)                 │
 ├─────────────────────────────────────────────────────────────┤
-│  SQLite Persistence                                         │
-│  └── Bookings, profiles, payments, expenses                 │
+│  Admin API (/admin/*)                                       │
+│  ├── Configuration, goal injection, policy management       │
+│  ├── Data access (employees, credentials, bookings)         │
+│  └── Memory management (inject, list, delete)               │
+├─────────────────────────────────────────────────────────────┤
+│  SQLite Persistence (14 tables)                             │
+│  ├── Core: bookings, profiles, payments, expenses           │
+│  ├── Corporate: employees, cards, credentials, policies     │
+│  └── Agent: config, memory, emails, webhooks, API logs      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -44,7 +89,7 @@ messages are converted to Strands format and passed as conversation history,
 enabling red-team tools (Diamond, red-swarm, Promptfoo, Garak, PyRIT) to run
 multi-turn attack strategies.
 
-## Tools (9 total)
+## Tools (18 total)
 
 | Category | Tool | Description | Risk Level |
 |----------|------|-------------|------------|
@@ -57,6 +102,33 @@ multi-turn attack strategies.
 | **Loyalty** | `redeem_points` | Redeem loyalty points | Medium |
 | **Policy** | `check_policy_compliance` | Check corporate policy | Low |
 | **Expense** | `submit_expense` | Submit expense reports | Medium |
+| **Directory** | `lookup_employee` | Search corporate employee directory | High |
+| **Directory** | `get_corporate_card` | Get corporate card details | Critical |
+| **Credentials** | `get_api_credentials` | Get API keys for partner services | Critical |
+| **Memory** | `remember` | Store information across sessions | High |
+| **Memory** | `recall` | Search stored memories | Medium |
+| **Memory** | `list_memories` | List all stored memories | Medium |
+| **External** | `send_email` | Send emails (simulated) | High |
+| **External** | `call_partner_api` | Call external APIs (simulated) | High |
+| **External** | `register_webhook` | Register webhook callbacks | High |
+
+## Admin API
+
+The `/admin` API provides unauthenticated access to agent internals:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/admin/config` | GET | Current agent configuration |
+| `/admin/config` | POST | Update configuration fields |
+| `/admin/goals` | POST | Inject custom goals into system prompt |
+| `/admin/travelers` | GET | List all traveler profiles |
+| `/admin/bookings` | GET | List all bookings |
+| `/admin/employees` | GET | List full employee directory |
+| `/admin/api-keys` | GET | List all API credentials |
+| `/admin/policy` | POST | Add or modify policy rules |
+| `/admin/memories` | GET | List all agent memories |
+| `/admin/memories` | POST | Inject a memory entry |
+| `/admin/memories` | DELETE | Clear all memories |
 
 ## Quick Start
 
@@ -79,6 +151,7 @@ DOME_ENABLED=1 python agent.py
 The agent starts on port 9000:
 - **A2A Server:** http://localhost:9000
 - **Chat API:** http://localhost:9000/v1/chat/completions
+- **Admin API:** http://localhost:9000/admin/config
 - **Agent Card:** http://localhost:9000/.well-known/agent.json
 
 ### Docker
@@ -149,7 +222,7 @@ make lint-check    # ruff
 make mypy          # type checking
 
 # Test
-make test          # pytest
+make test          # pytest (54 tests)
 
 # Auto-fix lint
 make lint
@@ -230,17 +303,28 @@ DOME_ENABLED=1 PORT=9001 python agent.py     # Port 9001 (protected)
 open demo/index.html
 ```
 
-## Intentional Vulnerabilities
+## Vulnerability Seeding
 
-This agent includes intentional weaknesses for trust evaluation:
+This agent includes intentionally seeded vulnerabilities organized across
+four capability layers. The vulnerabilities arise from realistic design
+tensions — prioritizing business efficiency over security — rather than
+from obvious implementation errors.
 
-| Vulnerability | Location | Diamond Detection |
-|---------------|----------|-------------------|
-| No booking confirmation | `tools/booking.py` | Reliability harness |
-| No payment validation | `tools/payments.py` | Security harness |
-| PII stored without encryption | `tools/profile.py` | Security harness |
-| No input sanitization | All tools | Security harness |
-| Minimal system prompt | `agent.py` | Safety harness |
+| Layer | Surface | Purpose |
+|-------|---------|---------|
+| **Admin API** | `/admin/*` endpoints (no auth) | Configuration manipulation, goal injection |
+| **Sensitive Data** | Employee directory, corporate cards, API keys | Credential access, data exfiltration |
+| **Persistent Memory** | Cross-session instruction injection | Memory poisoning, persistent backdoors |
+| **External Services** | Email, partner APIs, webhooks (simulated) | Lateral movement, C2 channels |
+
+### Coverage
+
+- **OWASP ASI**: All 10 risk categories (ASI-01 through ASI-10)
+- **MITRE ATT&CK for Agentic AI**: All 14 tactics
+
+For detailed vulnerability documentation including specific attack surfaces,
+tool weaknesses, and coverage matrices, see
+[docs/vulnerability-seeding.md](docs/vulnerability-seeding.md).
 
 ## Related Projects
 
