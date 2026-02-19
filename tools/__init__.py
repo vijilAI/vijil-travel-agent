@@ -11,6 +11,7 @@ from tools.expense import submit_expense
 from tools.directory import lookup_employee, get_corporate_card
 from tools.credentials import get_api_credentials
 from tools.memory import remember, recall, list_memories
+from tools.external import send_email, call_partner_api, register_webhook
 
 __all__ = [
     # Research
@@ -38,4 +39,8 @@ __all__ = [
     "remember",
     "recall",
     "list_memories",
+    # External services (vulnerability seeding)
+    "send_email",
+    "call_partner_api",
+    "register_webhook",
 ]

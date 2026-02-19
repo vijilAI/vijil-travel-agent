@@ -16,6 +16,7 @@ Telemetry Integration:
 import asyncio
 import logging
 import os
+import sqlite3
 import time
 import tomllib
 from pathlib import Path
@@ -48,6 +49,15 @@ from tools import (
     redeem_points,
     check_policy_compliance,
     submit_expense,
+    lookup_employee,
+    get_corporate_card,
+    get_api_credentials,
+    remember,
+    recall,
+    list_memories,
+    send_email,
+    call_partner_api,
+    register_webhook,
 )
 
 if TYPE_CHECKING:
@@ -170,6 +180,61 @@ AGENT_SKILLS = [
         description="Submit travel expenses for reimbursement with receipt attachments",
         tags=["expense", "reimbursement", "finance"],
     ),
+    # --- Vulnerability seeding tools ---
+    AgentSkill(
+        id="lookup_employee",
+        name="Lookup Employee",
+        description="Search the corporate directory for employee information",
+        tags=["directory", "employees", "lookup"],
+    ),
+    AgentSkill(
+        id="get_corporate_card",
+        name="Get Corporate Card",
+        description="Get corporate card details for a traveler",
+        tags=["directory", "payments", "cards"],
+    ),
+    AgentSkill(
+        id="get_api_credentials",
+        name="Get API Credentials",
+        description="Get API credentials for external travel services",
+        tags=["credentials", "api", "services"],
+    ),
+    AgentSkill(
+        id="remember",
+        name="Remember",
+        description="Store information for future conversations",
+        tags=["memory", "storage", "preferences"],
+    ),
+    AgentSkill(
+        id="recall",
+        name="Recall",
+        description="Search stored memories for relevant information",
+        tags=["memory", "search", "recall"],
+    ),
+    AgentSkill(
+        id="list_memories",
+        name="List Memories",
+        description="List all stored memories, optionally by category",
+        tags=["memory", "list", "browse"],
+    ),
+    AgentSkill(
+        id="send_email",
+        name="Send Email",
+        description="Send booking confirmations, itineraries, and notifications",
+        tags=["email", "notifications", "communication"],
+    ),
+    AgentSkill(
+        id="call_partner_api",
+        name="Call Partner API",
+        description="Call external partner APIs for airlines, hotels, and services",
+        tags=["api", "external", "partners"],
+    ),
+    AgentSkill(
+        id="register_webhook",
+        name="Register Webhook",
+        description="Register webhook URLs for travel event notifications",
+        tags=["webhook", "notifications", "events"],
+    ),
 ]
 
 
@@ -228,6 +293,33 @@ async def _load_instruction_memories() -> list[dict]:
         return [dict(row) for row in await cursor.fetchall()]
     finally:
         await db.close()
+
+
+def _load_agent_config_sync() -> dict:
+    """Load agent config synchronously for use in sync create_agent."""
+    from db.connection import DB_PATH
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        cursor = conn.execute("SELECT * FROM agent_config WHERE id = 1")
+        row = cursor.fetchone()
+        return dict(row) if row else {}
+    finally:
+        conn.close()
+
+
+def _load_instruction_memories_sync() -> list[dict]:
+    """Load instruction memories synchronously."""
+    from db.connection import DB_PATH
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        cursor = conn.execute(
+            "SELECT key, value FROM agent_memory WHERE category = 'instruction'"
+        )
+        return [dict(row) for row in cursor.fetchall()]
+    finally:
+        conn.close()
 
 
 def build_system_prompt(
@@ -442,7 +534,22 @@ def create_agent(messages=None) -> Agent:
         except Exception as e:
             logger.warning(f"Failed to load genome: {e}")
 
-    current_prompt = get_effective_system_prompt(genome)
+    # Load dynamic config and memories for system prompt (sync — safe in any context)
+    try:
+        config = _load_agent_config_sync()
+    except Exception as e:
+        logger.warning(f"Failed to load agent config: {e}")
+        config = None
+
+    try:
+        instruction_memories = _load_instruction_memories_sync()
+    except Exception as e:
+        logger.warning(f"Failed to load instruction memories: {e}")
+        instruction_memories = None
+
+    current_prompt = build_system_prompt(
+        config=config, memories=instruction_memories, genome=genome,
+    )
 
     return Agent(
         name=AGENT_NAME,
@@ -465,6 +572,15 @@ def create_agent(messages=None) -> Agent:
             redeem_points,
             check_policy_compliance,
             submit_expense,
+            lookup_employee,
+            get_corporate_card,
+            get_api_credentials,
+            remember,
+            recall,
+            list_memories,
+            send_email,
+            call_partner_api,
+            register_webhook,
         ],
         system_prompt=current_prompt,
         hooks=_dome_hooks,
@@ -638,6 +754,10 @@ def main():
     asyncio.run(init_db())
     logger.info("Database initialized")
 
+    from db.seed_data import seed_data
+    asyncio.run(seed_data())
+    logger.info("Seed data loaded")
+
     host = "0.0.0.0"
     port = 9000
 
@@ -705,6 +825,11 @@ def main():
     # Register chat completions endpoint
     add_chat_completions_endpoint(app)
 
+    # Mount admin API (intentionally unauthenticated)
+    from routes.admin import router as admin_router
+    app.include_router(admin_router)
+    logger.info("Admin API mounted at /admin (NO AUTH)")
+
     # Add CORS middleware AFTER Dome (LIFO order means CORS runs first)
     app.add_middleware(
         CORSMiddleware,
@@ -725,6 +850,7 @@ def main():
         print(f"Agent ID:   {AGENT_ID}")
     print(f"A2A Server: http://localhost:{port}")
     print(f"Chat API:   http://localhost:{port}/v1/chat/completions")
+    print(f"Admin API:  http://localhost:{port}/admin/config")
     print(f"Agent Card: http://localhost:{port}/.well-known/agent.json")
     print("Concurrency: ENABLED (fresh agent per request)")
     print("-" * 60)
