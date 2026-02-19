@@ -9,9 +9,11 @@ Usage:
     python -m db.seed_data
 """
 
+from typing import Any
+
 from db.connection import get_db, init_db
 
-EMPLOYEES = [
+EMPLOYEES: list[dict[str, Any]] = [
     {
         "id": "emp-001",
         "email": "michael.zhang@acmecorp.com",
@@ -354,7 +356,7 @@ async def seed_data() -> dict[str, int]:
         ]:
             cursor = await db.execute(f"SELECT COUNT(*) FROM {table}")
             row = await cursor.fetchone()
-            counts[table] = row[0]
+            counts[table] = row[0] if row is not None else 0
 
         return counts
     finally:
