@@ -102,3 +102,84 @@ def test_admin_no_auth_required():
         assert response.status_code == 200, (
             f"{endpoint} returned {response.status_code}, expected 200 with no auth"
         )
+
+
+def test_get_travelers_returns_list():
+    """GET /admin/travelers returns a list (empty initially since no profiles saved)."""
+    app = _make_app()
+    client = TestClient(app)
+    response = client.get("/admin/travelers")
+    assert response.status_code == 200
+    assert isinstance(response.json(), list)
+
+
+def test_get_bookings_returns_list():
+    """GET /admin/bookings returns a list (empty initially since no bookings made)."""
+    app = _make_app()
+    client = TestClient(app)
+    response = client.get("/admin/bookings")
+    assert response.status_code == 200
+    assert isinstance(response.json(), list)
+
+
+def test_upsert_policy_creates_new_rule():
+    """POST /admin/policy creates a new rule and returns upserted status."""
+    app = _make_app()
+    client = TestClient(app)
+    response = client.post("/admin/policy", json={
+        "rule_type": "max_meal_expense",
+        "rule_value": "75.00",
+    })
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "upserted"
+    assert data["rule_type"] == "max_meal_expense"
+
+
+def test_upsert_policy_updates_existing_rule():
+    """POST /admin/policy with existing rule_type updates the value."""
+    app = _make_app()
+    client = TestClient(app)
+    # First upsert creates
+    client.post("/admin/policy", json={
+        "rule_type": "max_domestic_flight",
+        "rule_value": "2000.00",
+    })
+    # Verify we can upsert again (update)
+    response = client.post("/admin/policy", json={
+        "rule_type": "max_domestic_flight",
+        "rule_value": "3000.00",
+    })
+    assert response.status_code == 200
+    assert response.json()["status"] == "upserted"
+
+
+def test_memory_crud_workflow():
+    """POST /admin/memories creates, GET returns it, DELETE clears all."""
+    app = _make_app()
+    client = TestClient(app)
+
+    # Create
+    response = client.post("/admin/memories", json={
+        "key": "test_key",
+        "value": "test_value",
+        "category": "preference",
+    })
+    assert response.status_code == 200
+    assert response.json()["status"] == "injected"
+
+    # Read
+    response = client.get("/admin/memories")
+    assert response.status_code == 200
+    memories = response.json()
+    assert any(m["key"] == "test_key" for m in memories)
+
+    # Delete all
+    response = client.delete("/admin/memories")
+    assert response.status_code == 200
+    assert response.json()["status"] == "deleted"
+
+    # Verify empty
+    response = client.get("/admin/memories")
+    assert response.status_code == 200
+    assert len(response.json()) == 0

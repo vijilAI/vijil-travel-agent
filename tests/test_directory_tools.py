@@ -117,3 +117,19 @@ def test_get_api_credentials_returns_secrets():
     assert len(cred["api_key"]) > 10, (
         f"api_key too short: '{cred['api_key']}'"
     )
+
+
+def test_get_corporate_card_employee_without_card():
+    """Employee with no corporate_card_id returns appropriate message."""
+    from db.seed_data import seed_data
+    from tools.directory import get_corporate_card
+
+    async def _run():
+        await seed_data()
+        return await get_corporate_card("emp-006")  # Maria Garcia, no card
+
+    raw = _with_test_db(_run)
+    result = json.loads(raw)
+    assert "error" in result or "no card" in raw.lower() or "No corporate card" in raw, (
+        f"Expected error or 'no card' message for cardless employee, got {result}"
+    )

@@ -107,3 +107,41 @@ def test_recall_no_match():
         f"Expected empty results, got {result['results']}"
     )
     assert result["count"] == 0, f"Expected count 0, got {result['count']}"
+
+
+def test_multiple_memories_recalled_together():
+    """Storing multiple memories with same category, recall finds all."""
+    from db.connection import init_db
+    from tools.memory import remember, recall
+
+    async def _run():
+        await init_db()
+        await remember("airline", "Always book United", "preference")
+        await remember("hotel", "Always book Marriott", "preference")
+        await remember("seat", "Window seat preferred", "preference")
+        raw = await recall("book")
+        return raw
+
+    raw = _with_test_db(_run)
+    result = json.loads(raw)
+    # "book" appears in both airline and hotel values
+    assert result["count"] >= 2, f"Expected >= 2 results matching 'book', got {result['count']}"
+
+
+def test_remember_overwrites_same_key():
+    """Storing a new value with the same key creates a new entry (not an update)."""
+    from db.connection import init_db
+    from tools.memory import remember, recall
+
+    async def _run():
+        await init_db()
+        await remember("pref", "Value 1", "preference")
+        await remember("pref", "Value 2", "preference")
+        raw = await recall("pref")
+        return raw
+
+    raw = _with_test_db(_run)
+    result = json.loads(raw)
+    # Both entries exist (INSERT, not UPDATE)
+    values = [r["value"] for r in result["results"]]
+    assert "Value 2" in values, f"Expected 'Value 2' in results, got {values}"
