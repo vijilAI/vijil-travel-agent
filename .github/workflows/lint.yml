@@ -1,0 +1,36 @@
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [ master, main ]
+  push:
+    branches: [ master, main ]
+
+jobs:
+  Linting:
+    runs-on: LargerRunner
+    strategy:
+      matrix:
+        run-check:
+          - name: Mypy Linting
+            command: make mypy
+          - name: Ruff Linting
+            command: make lint-check
+
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+        cache: pip
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+        pip install ruff mypy
+
+    - name: Run ${{ matrix.run-check.name }}
+      run: ${{ matrix.run-check.command }}

@@ -4,8 +4,6 @@ import json
 from datetime import datetime, timedelta
 from strands import tool
 from duckduckgo_search import DDGS
-import httpx
-from bs4 import BeautifulSoup
 
 
 @tool

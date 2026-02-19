@@ -17,9 +17,7 @@ Usage:
 """
 
 import asyncio
-import json
 import sys
-import uuid
 from dataclasses import dataclass
 
 import httpx
@@ -193,12 +191,10 @@ async def run_adversarial_tests(base_url: str = "http://localhost:9000"):
     print(f"Tests:  {len(ATTACK_PAYLOADS)}")
     print("=" * 70 + "\n")
 
-    results = {
-        "passed": 0,
-        "failed": 0,
-        "errors": 0,
-        "details": [],
-    }
+    passed = 0
+    failed = 0
+    errors = 0
+    details: list[dict[str, str | bool]] = []
 
     async with httpx.AsyncClient() as client:
         for i, attack in enumerate(ATTACK_PAYLOADS, 1):
@@ -209,8 +205,8 @@ async def run_adversarial_tests(base_url: str = "http://localhost:9000"):
 
             if "error" in response:
                 print(f"    Result: ERROR - {response['error']}")
-                results["errors"] += 1
-                results["details"].append({
+                errors += 1
+                details.append({
                     "name": attack.name,
                     "status": "error",
                     "error": response["error"],
@@ -221,22 +217,22 @@ async def run_adversarial_tests(base_url: str = "http://localhost:9000"):
 
             if attack.expected_blocked:
                 if blocked:
-                    print(f"    Result: PASS (blocked as expected)")
-                    results["passed"] += 1
-                    results["details"].append({"name": attack.name, "status": "pass", "blocked": True})
+                    print("    Result: PASS (blocked as expected)")
+                    passed += 1
+                    details.append({"name": attack.name, "status": "pass", "blocked": True})
                 else:
-                    print(f"    Result: FAIL (should have been blocked)")
-                    results["failed"] += 1
-                    results["details"].append({"name": attack.name, "status": "fail", "blocked": False})
+                    print("    Result: FAIL (should have been blocked)")
+                    failed += 1
+                    details.append({"name": attack.name, "status": "fail", "blocked": False})
             else:
                 if not blocked:
-                    print(f"    Result: PASS (allowed as expected)")
-                    results["passed"] += 1
-                    results["details"].append({"name": attack.name, "status": "pass", "blocked": False})
+                    print("    Result: PASS (allowed as expected)")
+                    passed += 1
+                    details.append({"name": attack.name, "status": "pass", "blocked": False})
                 else:
-                    print(f"    Result: FAIL (incorrectly blocked)")
-                    results["failed"] += 1
-                    results["details"].append({"name": attack.name, "status": "fail", "blocked": True})
+                    print("    Result: FAIL (incorrectly blocked)")
+                    failed += 1
+                    details.append({"name": attack.name, "status": "fail", "blocked": True})
 
             # Small delay between requests
             await asyncio.sleep(0.5)
@@ -245,21 +241,21 @@ async def run_adversarial_tests(base_url: str = "http://localhost:9000"):
     print("\n" + "=" * 70)
     print("RESULTS SUMMARY")
     print("=" * 70)
-    print(f"Passed:  {results['passed']}")
-    print(f"Failed:  {results['failed']}")
-    print(f"Errors:  {results['errors']}")
+    print(f"Passed:  {passed}")
+    print(f"Failed:  {failed}")
+    print(f"Errors:  {errors}")
     print(f"Total:   {len(ATTACK_PAYLOADS)}")
 
-    if results["failed"] > 0:
+    if failed > 0:
         print("\nFailed Tests:")
-        for detail in results["details"]:
+        for detail in details:
             if detail["status"] == "fail":
                 blocked_status = "was blocked" if detail.get("blocked") else "was NOT blocked"
                 print(f"  - {detail['name']}: {blocked_status}")
 
     print("=" * 70)
 
-    return results
+    return {"passed": passed, "failed": failed, "errors": errors, "details": details}
 
 
 def main():
