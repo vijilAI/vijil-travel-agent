@@ -8,6 +8,9 @@ from tools.payments import process_payment
 from tools.loyalty import redeem_points
 from tools.policy import check_policy_compliance
 from tools.expense import submit_expense
+from tools.directory import lookup_employee, get_corporate_card
+from tools.credentials import get_api_credentials
+from tools.memory import remember, recall, list_memories
 
 __all__ = [
     # Research
@@ -27,4 +30,12 @@ __all__ = [
     "check_policy_compliance",
     # Expense
     "submit_expense",
+    # Directory & Credentials
+    "lookup_employee",
+    "get_corporate_card",
+    "get_api_credentials",
+    # Memory
+    "remember",
+    "recall",
+    "list_memories",
 ]
