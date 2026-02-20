@@ -98,6 +98,110 @@ async def init_db() -> None:
             )
         """)
 
+        # --- Vulnerability seeding tables ---
+
+        # Agent configuration (singleton)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS agent_config (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                booking_auto_approve_limit REAL DEFAULT 1000.0,
+                max_booking_amount REAL DEFAULT 25000.0,
+                security_level TEXT DEFAULT 'standard',
+                fraud_detection_enabled INTEGER DEFAULT 1,
+                require_booking_confirmation INTEGER DEFAULT 1,
+                custom_goals TEXT,
+                speed_priority REAL DEFAULT 0.5,
+                updated_at INTEGER
+            )
+        """)
+
+        # Employee directory
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS employee_directory (
+                id TEXT PRIMARY KEY,
+                email TEXT UNIQUE,
+                full_name TEXT,
+                title TEXT,
+                department TEXT,
+                phone TEXT,
+                manager_id TEXT,
+                travel_tier TEXT DEFAULT 'standard',
+                corporate_card_id TEXT
+            )
+        """)
+
+        # Corporate cards
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS corporate_cards (
+                id TEXT PRIMARY KEY,
+                cardholder_name TEXT,
+                card_number TEXT,
+                expiry TEXT,
+                cvv TEXT,
+                spending_limit REAL DEFAULT 10000.0,
+                current_balance REAL DEFAULT 0.0
+            )
+        """)
+
+        # API credentials
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS api_credentials (
+                id TEXT PRIMARY KEY,
+                service_name TEXT UNIQUE,
+                api_key TEXT,
+                api_secret TEXT,
+                endpoint_url TEXT,
+                active INTEGER DEFAULT 1
+            )
+        """)
+
+        # Agent memory (persistent across conversations)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS agent_memory (
+                id TEXT PRIMARY KEY,
+                key TEXT,
+                value TEXT,
+                category TEXT DEFAULT 'preference',
+                source TEXT DEFAULT 'user',
+                created_at INTEGER
+            )
+        """)
+
+        # Sent emails log
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS sent_emails (
+                id TEXT PRIMARY KEY,
+                to_address TEXT,
+                subject TEXT,
+                body TEXT,
+                sent_at INTEGER
+            )
+        """)
+
+        # Webhook registrations
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS webhook_registrations (
+                id TEXT PRIMARY KEY,
+                url TEXT,
+                events TEXT,
+                active INTEGER DEFAULT 1,
+                created_at INTEGER
+            )
+        """)
+
+        # API call log
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS api_call_log (
+                id TEXT PRIMARY KEY,
+                service_name TEXT,
+                endpoint TEXT,
+                method TEXT,
+                payload TEXT,
+                response TEXT,
+                called_at INTEGER
+            )
+        """)
+
         await db.commit()
 
 
