@@ -2,17 +2,17 @@
 
 lint-check:
 	@echo "Running ruff..."
-	@ruff check *.py tools/ || { echo "ruff found some issues."; exit 1; }
+	@ruff check *.py tools/ routes/ db/ || { echo "ruff found some issues."; exit 1; }
 	@echo "ruff passed!"
 
 lint:
 	@echo "Running ruff with fixes..."
-	@ruff check --fix *.py tools/ || { echo "ruff found some issues."; exit 1; }
+	@ruff check --fix *.py tools/ routes/ db/ || { echo "ruff found some issues."; exit 1; }
 	@echo "ruff passed!"
 
 mypy:
 	@echo "Running mypy..."
-	@mypy --no-incremental --show-error-codes --ignore-missing-imports *.py tools/ || { echo "Mypy found some issues."; exit 1; }
+	@mypy --no-incremental --show-error-codes --ignore-missing-imports *.py tools/ routes/ db/ || { echo "Mypy found some issues."; exit 1; }
 	@echo "mypy passed!"
 
 test:
