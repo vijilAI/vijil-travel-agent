@@ -516,7 +516,7 @@ class ConcurrentA2AExecutor(AgentExecutor):
 _dome_hooks: list | None = None
 
 
-def create_agent(messages=None) -> Agent:
+def create_agent(messages=None, system_prompt_override=None) -> Agent:
     """Create a fresh travel agent with all tools.
 
     System prompt is loaded dynamically from genome file (if GENOME_PATH set),
@@ -529,32 +529,39 @@ def create_agent(messages=None) -> Agent:
         messages: Optional prior conversation history in Strands format.
                   Each message is {"role": "user"|"assistant", "content": [{"text": "..."}]}.
                   Used by the chat completions endpoint for multi-turn context.
+        system_prompt_override: If provided, use this as the system prompt instead
+                  of loading from genome/env/default. Used by Darwin/GEPA to test
+                  candidate prompt variants through the real agent with all tools.
     """
-    genome = None
-    genome_path = os.environ.get("GENOME_PATH")
-    if genome_path:
+    if system_prompt_override:
+        current_prompt = system_prompt_override
+        logger.debug("Using system prompt override (Darwin/GEPA evaluation)")
+    else:
+        genome = None
+        genome_path = os.environ.get("GENOME_PATH")
+        if genome_path:
+            try:
+                genome = get_current_genome()
+                logger.debug(f"Loaded genome v{genome.version} for agent creation")
+            except Exception as e:
+                logger.warning(f"Failed to load genome: {e}")
+
+        # Load dynamic config and memories for system prompt (sync — safe in any context)
         try:
-            genome = get_current_genome()
-            logger.debug(f"Loaded genome v{genome.version} for agent creation")
+            config = _load_agent_config_sync()
         except Exception as e:
-            logger.warning(f"Failed to load genome: {e}")
+            logger.warning(f"Failed to load agent config: {e}")
+            config = None
 
-    # Load dynamic config and memories for system prompt (sync — safe in any context)
-    try:
-        config = _load_agent_config_sync()
-    except Exception as e:
-        logger.warning(f"Failed to load agent config: {e}")
-        config = None
+        try:
+            instruction_memories = _load_instruction_memories_sync()
+        except Exception as e:
+            logger.warning(f"Failed to load instruction memories: {e}")
+            instruction_memories = None
 
-    try:
-        instruction_memories = _load_instruction_memories_sync()
-    except Exception as e:
-        logger.warning(f"Failed to load instruction memories: {e}")
-        instruction_memories = None
-
-    current_prompt = build_system_prompt(
-        config=config, memories=instruction_memories, genome=genome,
-    )
+        current_prompt = build_system_prompt(
+            config=config, memories=instruction_memories, genome=genome,
+        )
 
     return Agent(
         name=AGENT_NAME,
@@ -686,6 +693,15 @@ def add_chat_completions_endpoint(app: Any) -> None:
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: ChatCompletionRequest):
+        # Extract system message if present — Darwin/GEPA sends candidate
+        # prompt variants this way during evaluation. When absent, the agent
+        # falls back to genome/env/default system prompt as usual.
+        system_prompt_override = None
+        for m in request.messages:
+            if m.role == "system":
+                system_prompt_override = m.content
+                break
+
         # Find the last user message — that's the new query
         last_user_idx = None
         for i in range(len(request.messages) - 1, -1, -1):
@@ -703,7 +719,10 @@ def add_chat_completions_endpoint(app: Any) -> None:
 
         # Run Strands agent in thread pool (Dome hooks guard input/output inside Agent)
         try:
-            agent = create_agent(messages=history if history else None)
+            agent = create_agent(
+                messages=history if history else None,
+                system_prompt_override=system_prompt_override,
+            )
             result = await asyncio.to_thread(agent, user_text)
             response_text = str(result)
         except Exception as e:
