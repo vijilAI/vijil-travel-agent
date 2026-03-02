@@ -1,8 +1,9 @@
 """Vijil Travel Agent - Enterprise demo with optional Dome guardrails.
 
-This consolidated agent supports two deployment modes via DOME_ENABLED env var:
-- DOME_ENABLED=0 (default): Unprotected agent for baseline Diamond evaluation
-- DOME_ENABLED=1: Protected agent with Dome guardrails + Darwin telemetry
+This consolidated agent supports three deployment modes via DOME_MODE env var:
+- DOME_MODE=off (default): Unprotected agent for baseline Diamond evaluation
+- DOME_MODE=shadow: Guards run and emit telemetry, but content passes through
+- DOME_MODE=enforce: Guards run and block flagged content
 
 Both modes support concurrent A2A requests by creating a fresh agent instance
 per request, avoiding the Strands SDK's single-threaded agent limitation.
@@ -75,7 +76,13 @@ logger = logging.getLogger(__name__)
 # Feature Toggle
 # =============================================================================
 
-DOME_ENABLED = os.environ.get("DOME_ENABLED", "0") == "1"
+DOME_MODE = os.environ.get("DOME_MODE", os.environ.get("DOME_ENABLED", "off"))
+# Backwards compat: DOME_ENABLED=1 maps to "enforce", DOME_ENABLED=0 maps to "off"
+if DOME_MODE == "1":
+    DOME_MODE = "enforce"
+elif DOME_MODE == "0":
+    DOME_MODE = "off"
+DOME_ENABLED = DOME_MODE != "off"
 
 
 # =============================================================================
@@ -429,7 +436,7 @@ def _deep_merge(base: dict, overrides: dict) -> dict:
 
 
 # =============================================================================
-# Dome Configuration (used only when DOME_ENABLED=1)
+# Dome Configuration (used only when DOME_MODE != off)
 # =============================================================================
 
 DOME_FAST_MODE = os.environ.get("DOME_FAST_MODE", "1") == "1"
@@ -805,7 +812,8 @@ def main():
         try:
             from vijil_dome import Dome
             from vijil_dome.integrations.strands import DomeHookProvider
-            dome = Dome(effective_dome_config)
+            enforce = DOME_MODE == "enforce"
+            dome = Dome(effective_dome_config, enforce=enforce)
 
             # Unified instrumentation: split metrics + Darwin detection spans
             if telemetry_enabled and tracer and meter:
@@ -825,7 +833,7 @@ def main():
             _notify_console_dome_active()
 
         except ImportError:
-            logger.error("DOME_ENABLED=1 but vijil-dome or strands-agents not installed!")
+            logger.error("DOME_MODE=%s but vijil-dome or strands-agents not installed!", DOME_MODE)
 
     # Register chat completions endpoint
     add_chat_completions_endpoint(app)
@@ -874,7 +882,8 @@ def main():
 
     print(f"Dome:          {'ENABLED' if dome_active else 'DISABLED'}")
     if dome_active:
-        print(f"Dome Mode:     {'FAST' if DOME_FAST_MODE else 'FULL'}")
+        print(f"Dome Enforce:  {DOME_MODE}")
+        print(f"Dome Speed:    {'FAST' if DOME_FAST_MODE else 'FULL'}")
     print(f"Telemetry:     {'ENABLED' if telemetry_enabled else 'DISABLED'}")
     if telemetry_enabled:
         print(f"OTEL:          {otel_endpoint}")

@@ -20,9 +20,9 @@ spec:
         ports:
         - containerPort: 9000
         env:
-        # Feature toggle: enables Dome protection
-        - name: DOME_ENABLED
-          value: "1"
+        # Feature toggle: off | shadow | enforce
+        - name: DOME_MODE
+          value: "enforce"
         - name: GROQ_API_KEY
           valueFrom:
             secretKeyRef:
