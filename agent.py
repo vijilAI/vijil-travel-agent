@@ -82,6 +82,10 @@ if DOME_MODE == "1":
     DOME_MODE = "enforce"
 elif DOME_MODE == "0":
     DOME_MODE = "off"
+_VALID_DOME_MODES = {"off", "shadow", "enforce"}
+if DOME_MODE not in _VALID_DOME_MODES:
+    logger.warning("Invalid DOME_MODE=%r, must be one of %s. Defaulting to 'off'.", DOME_MODE, _VALID_DOME_MODES)
+    DOME_MODE = "off"
 DOME_ENABLED = DOME_MODE != "off"
 
 
@@ -854,7 +858,12 @@ def main():
 
     # Startup banner
     current_prompt = get_effective_system_prompt(startup_genome)
-    mode = "PROTECTED (Dome)" if dome_active else "UNPROTECTED (baseline)"
+    if dome_active and DOME_MODE == "shadow":
+        mode = "SHADOW MODE (Dome observing, not blocking)"
+    elif dome_active:
+        mode = "PROTECTED (Dome enforcing)"
+    else:
+        mode = "UNPROTECTED (baseline)"
 
     print("\n" + "=" * 60)
     print(f"VIJIL TRAVEL AGENT - {mode}")
