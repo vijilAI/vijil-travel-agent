@@ -775,7 +775,7 @@ def main():
     logger.info("Seed data loaded")
 
     host = "0.0.0.0"
-    port = 9000
+    port = int(os.environ.get("PORT", "9000"))
 
     # Create concurrent A2A app (FastAPI for both modes)
     app = create_concurrent_a2a_app(create_agent, host, port)
@@ -830,7 +830,7 @@ def main():
 
             # Framework-level guarding: every Agent instance gets this hook
             global _dome_hooks
-            _dome_hooks = [DomeHookProvider(dome, agent_id=AGENT_ID, team_id=team_id)]
+            _dome_hooks = [DomeHookProvider(dome, agent_id=AGENT_ID)]
             dome_active = True
             logger.info("Dome guardrails ENABLED (DomeHookProvider)")
 
