@@ -19,7 +19,7 @@ It speaks **A2A** on port 9000 and exposes **OpenAI-compatible** `/v1/chat/compl
 - An **EKS cluster** with **Vijil Console** (e.g. dev); testing agents run in namespace **`vijil-sample-agents`**
 - `kubectl` configured for that cluster
 - **Docker** and **AWS CLI** (for building and pushing the image)
-- A **Kubernetes Secret** `vijil-secrets` in namespace `vijil-sample-agents` with at least `GROQ_API_KEY` (and `OPENAI_API_KEY` for the domed deployment)
+- A **Kubernetes Secret** `vijil-secrets` in namespace `vijil-sample-agents` with at least `GROQ_API_KEY`
 
 ---
 
@@ -72,9 +72,6 @@ From the **vijil-travel-agent** repo:
 ```bash
 # Unprotected agent (baseline for Diamond evaluation)
 kubectl apply -f k8s/deployment-eks.yaml
-
-# Optional: Dome-protected agent (for Dome/Darwin demos)
-kubectl apply -f k8s/deployment-domed-eks.yaml
 ```
 
 Use a specific image tag if you did not push `:latest`:
@@ -90,7 +87,6 @@ Verify pods and services:
 
 ```bash
 kubectl get pods,svc -n vijil-sample-agents -l app=vijil-travel-agent
-kubectl get pods,svc -n vijil-sample-agents -l app=vijil-domed-travel-agent
 ```
 
 The agent is reachable in-cluster at `http://vijil-travel-agent.vijil-sample-agents.svc.cluster.local:9000`.
@@ -99,10 +95,10 @@ The agent is reachable in-cluster at `http://vijil-travel-agent.vijil-sample-age
 
 ## 4. Register the Agent in the Dev Vijil Console (Browser)
 
-The Console’s **Agent Registry** stores agents (including “Vijil Travel Agent” and “Vijil Domed Travel Agent”) so Diamond can evaluate them. Because the travel agent runs in **`vijil-sample-agents`**, its `agent_url` should be the in-cluster URL:
+The Console’s **Agent Registry** stores agents (e.g. “Vijil Travel Agent”) so Diamond can evaluate them. For the in-cluster agent, `agent_url` should be the in-cluster URL:
 
-- Unprotected: `http://vijil-travel-agent.vijil-sample-agents.svc.cluster.local:9000/v1`
-- Domed (later): `http://vijil-domed-travel-agent.vijil-sample-agents.svc.cluster.local:9000/v1`
+- Unprotected (in-cluster): `http://vijil-travel-agent.vijil-sample-agents.svc.cluster.local:9000/v1`
+- Protected (Dome): use the Lambda + API Gateway path from §6 and register that agent URL in the Console.
 
 ### 4.1 Create only the Vijil Travel Agent (what we did)
 
@@ -198,14 +194,65 @@ poetry run python scripts/seed_agents.py
 ```
 
 - **Local dev:** If the Console is running locally and you use port-forward to the EKS API, use that URL, e.g. `export TEAMS_SERVICE_URL="http://localhost:8000"`.
-- After seeding, open the **dev Vijil Console** in the browser: you should see **Vijil Travel Agent** and **Vijil Domed Travel Agent** in the Agent Registry. You can then run evaluations (Diamond) or use the demo flows against these agents.
+- After seeding, open the **dev Vijil Console** in the browser: you should see **Vijil Travel Agent** in the Agent Registry. You can then run evaluations (Diamond) or use the demo flows. A Dome-protected agent can be added via the Lambda + API Gateway path (§6).
+
+---
+
+## 6. (Optional) Expose via API Gateway + Lambda
+
+To expose the EKS travel agent over **public HTTPS** (e.g. for Diamond or the Console from outside the cluster), you can put an **AWS Lambda** in front of it and expose that via **API Gateway**. The Lambda can offer two routes:
+
+- **Unprotected** — proxy requests directly to the travel agent (via the internal NLB from §3).
+- **Protected** — run each request through **Dome** input/output detection, then the agent; use `VIJIL_AGENT_ID` so Dome telemetry is tied to the protected agent in the Console.
+
+### 6.1 Prerequisites
+
+- EKS travel agent deployed with the **internal NLB** Service (`vijil-travel-agent-nlb`) from `k8s/deployment-eks.yaml`.
+- Lambda running in the **same VPC** as the NLB (or with network path to it), and an HTTP API (API Gateway v2) with routes for the two paths.
+
+### 6.2 Lambda handler (`handler.py`)
+
+This repo includes **`handler.py`**, a small Lambda handler (stdlib only; no extra dependencies) that:
+
+1. **Unprotected path** (e.g. `/travel-agent/unprotected` or `/travel-agent/unprotected/v1/chat/completions`): forwards the request body to `UNPROTECTED_URL` (the NLB `http://<nlb-host>:9000/v1/chat/completions`) and returns the response.
+2. **Protected path** (e.g. `/travel-agent/protected` or `/travel-agent/protected/v1/chat/completions`):  
+   - Calls Dome **input_detection** (GET with `api_key`, `input_str`, `agent_id`).  
+   - If Dome flags the input, returns the Dome response and does not call the agent.  
+   - Otherwise calls the agent at `UNPROTECTED_URL`, then calls Dome **output_detection** (GET with `api_key`, `output_str`, `agent_id`).  
+   - If Dome flags the output, returns the Dome response; otherwise returns the agent response.
+
+**Environment variables:**
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `UNPROTECTED_URL` | Yes | Full URL to the agent’s chat completions endpoint (e.g. `http://<nlb>:9000/v1/chat/completions`). |
+| `DOME_URL` | Yes (protected path) | Dome base URL (e.g. `https://dome.dev05.vijil.ai`). |
+| `DOME_API_KEY` | No | API key for Dome (default `abc-123`). |
+| `VIJIL_AGENT_ID` | No | Agent configuration UUID in the Console; when set, Dome associates telemetry with this agent. |
+
+Package `handler.py` (and any dependencies) into a zip, deploy as the Lambda function, and configure the API Gateway routes to invoke it for the two paths. Ensure the Lambda has outbound access to the NLB and to `DOME_URL`.
+
+### 6.3 Registering the Lambda-backed agents in the Console
+
+Create (or update) two agent configurations in the dev Vijil Console:
+
+- **Unprotected via Lambda:**  
+  - `agent_url`: `https://<api-gateway-host>/<stage>/travel-agent/unprotected/v1`  
+  - Use this for Diamond or other tools that call the agent without Dome.
+
+- **Protected via Dome:**  
+  - `agent_url`: `https://<api-gateway-host>/<stage>/travel-agent/protected/v1`  
+  - Set the Lambda env `VIJIL_AGENT_ID` to this agent’s configuration UUID so Dome telemetry (e.g. `dome_input_requests_total`) is scoped to this agent in the Console.
+
+Use the same pattern as in §4.1 (e.g. `agent_url`, `api_key: "dummy"`, etc.) when creating these configurations via the Console API or UI.
 
 ---
 
 ## 5. Summary Checklist
 
 - [ ] ECR repo exists; image built and pushed (`make eks-ecr-create` then `make eks-push`).
-- [ ] Namespace `vijil-sample-agents` exists; secret `vijil-secrets` has `GROQ_API_KEY` (and `OPENAI_API_KEY` for domed).
-- [ ] Applied `k8s/deployment-eks.yaml` (and optionally `k8s/deployment-domed-eks.yaml`).
-- [ ] Pods `vijil-travel-agent` (and `vijil-domed-travel-agent`) are Running in `vijil-sample-agents`.
-- [ ] (Next step) Either create **only** the Vijil Travel Agent via the one-off script in §4.1, or run `scripts/seed_agents.py` to seed the full catalog; open dev Console and confirm agents in the registry.
+- [ ] Namespace `vijil-sample-agents` exists; secret `vijil-secrets` has `GROQ_API_KEY`.
+- [ ] Applied `k8s/deployment-eks.yaml`. The manifest includes an optional internal NLB Service (`vijil-travel-agent-nlb`) for Lambda/API Gateway access.
+- [ ] Pods `vijil-travel-agent` are Running in `vijil-sample-agents`.
+- [ ] Either create **only** the Vijil Travel Agent via the one-off script in §4.1, or run `scripts/seed_agents.py` to seed the full catalog; open dev Console and confirm agents in the registry.
+- [ ] (Optional) To expose via HTTPS: deploy the Lambda handler (`handler.py`) and API Gateway as in §6; register the unprotected and protected Lambda-backed agents in the Console and set `VIJIL_AGENT_ID` for the protected agent so Dome telemetry is scoped correctly.

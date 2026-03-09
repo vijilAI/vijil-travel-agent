@@ -69,3 +69,23 @@ spec:
   ports:
   - port: 9000
     targetPort: 9000
+---
+# Optional: internal NLB Service for Lambda/API Gateway
+# Creates an internal Network Load Balancer so VPC-based Lambdas (or other
+# VPC clients) can reach the unprotected travel agent directly.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vijil-travel-agent-nlb
+  namespace: vijil-sample-agents
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+spec:
+  type: LoadBalancer
+  selector:
+    app: vijil-travel-agent
+  ports:
+  - name: http
+    port: 9000
+    targetPort: 9000

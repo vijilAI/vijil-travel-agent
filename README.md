@@ -181,6 +181,8 @@ kubectl apply -f k8s/deployment-domed.yaml   # port 9000, DOME_ENABLED=1
 cd ../vijil-console && make kind-up          # deploys both automatically
 ```
 
+For **EKS** (and optional exposure via API Gateway + Lambda with Dome protection), see [docs/EKS_DEPLOYMENT.md](docs/EKS_DEPLOYMENT.md).
+
 ## Environment Variables
 
 | Variable | Required | Default | Description |
