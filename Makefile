@@ -14,9 +14,10 @@ build:
 build-eks:
 	docker build --platform linux/amd64 -t vijil-travel-agent:$(IMAGE_TAG) -t vijil-travel-agent:latest .
 
-# Push image to ECR. Requires: AWS CLI configured, ECR repo to exist (make eks-ecr-create).
+# Push image to ECR. Requires: AWS CLI configured.
+# Depends on eks-ecr-create so the repository is created on first use.
 # Uses build-eks so the image is linux/amd64 and can run on EKS nodes.
-eks-push: build-eks
+eks-push: eks-ecr-create build-eks
 	aws ecr get-login-password --region $(AWS_REGION) | docker login --username AWS --password-stdin $(ECR_REGISTRY) && \
 	docker tag vijil-travel-agent:$(IMAGE_TAG) $(ECR_REPO):$(IMAGE_TAG) && \
 	docker tag vijil-travel-agent:$(IMAGE_TAG) $(ECR_REPO):latest && \

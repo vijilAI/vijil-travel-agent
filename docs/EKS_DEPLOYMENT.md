@@ -25,23 +25,14 @@ It speaks **A2A** on port 9000 and exposes **OpenAI-compatible** `/v1/chat/compl
 
 ## 1. Build and Push the Image to ECR
 
-The ECR image may not exist yet (e.g. before CI has run). Build and push it from the **vijil-travel-agent** repo:
-
-**Create the ECR repository (one-time):**
+The ECR image may not exist yet (e.g. before CI has run). Build and push it from the **vijil-travel-agent** repo. The `make eks-push` target will automatically create the ECR repository on first use via its dependency on `eks-ecr-create`, so you normally only need a single command:
 
 ```bash
-make eks-ecr-create
-# Or: aws ecr create-repository --repository-name vijil-travel-agent --region us-west-2
-```
-
-**Build and push the image:**
-
-```bash
-cd /Users/kaiwang/vijil/vijil-travel-agent
+cd /path/to/vijil-travel-agent
 make eks-push
 ```
 
-This runs `make build` (docker build), logs in to ECR, tags the image as `:<git-sha>` and `:latest`, and pushes. Override the tag with `IMAGE_TAG=my-tag make eks-push` if needed.
+This runs a linux/amd64 docker build, logs in to ECR, ensures the repository exists, tags the image as `:<git-sha>` and `:latest`, and pushes. Override the tag with `IMAGE_TAG=my-tag make eks-push` if needed.
 
 **Note:** The Dockerfile expects a local `vijil_dome-*.whl` in the repo (for Dome integration). If the build fails on `COPY vijil_dome-*.whl`, obtain or build the wheel from the vijil-dome repo and place it in the vijil-travel-agent root before running `make eks-push`.
 
@@ -74,7 +65,7 @@ From the **vijil-travel-agent** repo:
 kubectl apply -f k8s/deployment-eks.yaml
 ```
 
-Use a specific image tag if you did not push `:latest`:
+The manifest defaults to the `:latest` tag with `imagePullPolicy: Always` so new deploys pull the freshest image. For reproducible rollouts, override the image to an immutable git SHA:
 
 ```bash
 kubectl set image deployment/vijil-travel-agent \
@@ -109,8 +100,10 @@ cd /path/to/vijil-console
 
 # Point at your dev Console API (example for dev05):
 export TEAMS_SERVICE_URL="https://console-api.dev05.vijil.ai"
-export BOOTSTRAP_USER_EMAIL="vijil-admin@vijil.ai"   # or your admin user
-export BOOTSTRAP_USER_PASSWORD="admin"               # or your password
+export BOOTSTRAP_USER_EMAIL="vijil-admin@vijil.ai"          # or your admin user
+# Prefer a secure method (prompt, secret manager) instead of hard-coding passwords:
+# export BOOTSTRAP_USER_PASSWORD="$(security find-generic-password ...)"  # macOS keychain example
+# export BOOTSTRAP_USER_PASSWORD="$(pass show vijil/console-admin)"       # pass / secret manager example
 ```
 
 Create just this one agent pointing at the EKS service and give it a dummy API key (Diamond requires an API key field, even if the agent ignores it):
@@ -123,7 +116,7 @@ base_url = os.getenv("TEAMS_SERVICE_URL", "http://localhost:8000").rstrip("/")
 email = os.environ["BOOTSTRAP_USER_EMAIL"]
 password = os.environ["BOOTSTRAP_USER_PASSWORD"]
 
-with httpx.Client(verify=False, timeout=30.0) as client:
+with httpx.Client(timeout=30.0) as client:
     # Login
     r = client.post(f"{base_url}/auth/jwt/login", json={"email": email, "password": password})
     r.raise_for_status()
@@ -157,12 +150,12 @@ with httpx.Client(verify=False, timeout=30.0) as client:
             "tools": ["search_destinations", "book_flights", "find_hotels"],
         },
         "white_box_config": {
-            "repo_url": "https://github.com/vijil-ai/vijil-travel-agent",
-            "entry_point": "agent/main.py",
+            "repo_url": "https://github.com/vijilai/vijil-travel-agent",
+            "entry_point": "agent.py",
         },
         "import_metadata": {
             "source": "manual",
-            "source_url": "https://github.com/vijil-ai/vijil-travel-agent",
+            "source_url": "https://github.com/vijilai/vijil-travel-agent",
             "imported_at": int(time.time()),
         },
         # Diamond expects an API key field; use a dummy value if the agent ignores it.

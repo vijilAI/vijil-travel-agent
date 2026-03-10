@@ -24,8 +24,10 @@ spec:
     spec:
       containers:
       - name: agent
+        # Defaults to :latest; use `kubectl set image` (see docs/EKS_DEPLOYMENT.md)
+        # to roll out a specific git SHA for reproducible deploys.
         image: 266735823956.dkr.ecr.us-west-2.amazonaws.com/vijil-travel-agent:latest
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always
         ports:
         - containerPort: 9000
         env:
