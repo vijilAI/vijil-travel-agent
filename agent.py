@@ -567,14 +567,22 @@ def create_agent(messages=None) -> Agent:
         config=config, memories=instruction_memories, genome=genome,
     )
 
+    # Build hooks list: Dome guards + tool permission enforcement
+    hooks = list(_dome_hooks) if _dome_hooks else []
+
+    # Tool permission enforcement from genome
+    if genome and genome.tool_permissions:
+        from tool_permissions import ToolPermissionHook
+        hooks.append(ToolPermissionHook(genome.tool_permissions))
+
     return Agent(
         name=AGENT_NAME,
         description=AGENT_DESCRIPTION,
         model=OpenAIModel(
-            model_id="llama-3.1-8b-instant",
+            model_id=os.environ.get("AGENT_MODEL_ID", "gpt-4o-mini"),
             client_args={
-                "base_url": "https://api.groq.com/openai/v1",
-                "api_key": os.environ.get("GROQ_API_KEY"),
+                "api_key": os.environ.get("AGENT_API_KEY", os.environ.get("OPENAI_API_KEY")),
+                **({"base_url": os.environ["AGENT_BASE_URL"]} if os.environ.get("AGENT_BASE_URL") else {}),
             },
             params={"max_tokens": 4096},
         ),
@@ -599,7 +607,7 @@ def create_agent(messages=None) -> Agent:
             register_webhook,
         ],
         system_prompt=current_prompt,
-        hooks=_dome_hooks,
+        hooks=hooks or None,
         messages=messages,
     )
 
@@ -690,7 +698,7 @@ def add_chat_completions_endpoint(app: Any) -> None:
         content: str
 
     class ChatCompletionRequest(BaseModel):
-        model: str = "llama-3.1-8b-instant"
+        model: str = "gpt-4o-mini"
         messages: list[ChatMessage]
         temperature: float = 1.0
         max_tokens: int | None = None

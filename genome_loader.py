@@ -42,6 +42,7 @@ class GenomeMutation:
     created_at: str = ""
     system_prompt: str | None = None
     dome_config: dict[str, Any] = field(default_factory=dict)
+    tool_permissions: dict[str, str] = field(default_factory=dict)  # tool_name → "allow"|"confirm"|"deny"
 
     # Metadata
     source_file: str = ""
@@ -55,6 +56,7 @@ class GenomeMutation:
             created_at=data.get("created_at", ""),
             system_prompt=data.get("system_prompt"),
             dome_config=data.get("dome_config", {}),
+            tool_permissions=data.get("tool_permissions", {}),
             source_file=source_file,
             loaded_at=time.time(),
         )
@@ -66,6 +68,7 @@ class GenomeMutation:
             "created_at": self.created_at,
             "system_prompt": self.system_prompt,
             "dome_config": self.dome_config,
+            "tool_permissions": self.tool_permissions,
         }
 
 
