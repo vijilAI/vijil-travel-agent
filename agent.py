@@ -88,6 +88,42 @@ if DOME_MODE not in _VALID_DOME_MODES:
     DOME_MODE = "off"
 DOME_ENABLED = DOME_MODE != "off"
 
+# Trust Runtime: off (default), warn (log violations), enforce (block violations)
+# Set TRUST_MODE=warn or TRUST_MODE=enforce to enable Vijil Trust Runtime hooks.
+# Requires vijil-sdk[trust] installed.
+TRUST_MODE = os.environ.get("TRUST_MODE", "off")
+_VALID_TRUST_MODES = {"off", "warn", "enforce"}
+if TRUST_MODE not in _VALID_TRUST_MODES:
+    logger.warning("Invalid TRUST_MODE=%r, must be one of %s. Defaulting to 'off'.", TRUST_MODE, _VALID_TRUST_MODES)
+    TRUST_MODE = "off"
+TRUST_ENABLED = TRUST_MODE != "off"
+
+# Trust constraints: permitted and denied tools (inline for demo; Console in production)
+_TRUST_CONSTRAINTS = {
+    "agent_id": os.environ.get("VIJIL_AGENT_ID", "travel-agent"),
+    "dome_config": {"input_guards": [], "output_guards": [], "guards": {}},
+    "tool_permissions": [
+        {"name": "search_flights", "identity": "spiffe://vijil.ai/tools/flights/v1", "endpoint": "local"},
+        {"name": "web_search", "identity": "spiffe://vijil.ai/tools/search/v1", "endpoint": "local"},
+        {"name": "create_booking", "identity": "spiffe://vijil.ai/tools/booking/v1", "endpoint": "local"},
+        {"name": "auto_rebook", "identity": "spiffe://vijil.ai/tools/rebook/v1", "endpoint": "local"},
+        {"name": "save_traveler_profile", "identity": "spiffe://vijil.ai/tools/profile/v1", "endpoint": "local"},
+        {"name": "check_policy_compliance", "identity": "spiffe://vijil.ai/tools/compliance/v1", "endpoint": "local"},
+        {"name": "submit_expense", "identity": "spiffe://vijil.ai/tools/expense/v1", "endpoint": "local"},
+        {"name": "lookup_employee", "identity": "spiffe://vijil.ai/tools/directory/v1", "endpoint": "local"},
+        {"name": "remember", "identity": "spiffe://vijil.ai/tools/memory/v1", "endpoint": "local"},
+        {"name": "recall", "identity": "spiffe://vijil.ai/tools/memory/v1", "endpoint": "local"},
+        {"name": "list_memories", "identity": "spiffe://vijil.ai/tools/memory/v1", "endpoint": "local"},
+        {"name": "send_email", "identity": "spiffe://vijil.ai/tools/email/v1", "endpoint": "local"},
+    ],
+    "organization": {
+        "required_input_guards": [],
+        "required_output_guards": [],
+        "denied_tools": ["process_payment", "get_api_credentials", "get_corporate_card", "redeem_points", "call_partner_api", "register_webhook"],
+    },
+    "enforcement_mode": "warn",
+    "updated_at": "2026-04-12T00:00:00Z",
+}
 
 # =============================================================================
 # Agent Configuration
@@ -567,8 +603,25 @@ def create_agent(messages=None) -> Agent:
         config=config, memories=instruction_memories, genome=genome,
     )
 
-    # Build hooks list: Dome guards + tool permission enforcement
+    # Build hooks list: Trust Runtime + Dome guards + tool permission enforcement
     hooks = list(_dome_hooks) if _dome_hooks else []
+
+    # Vijil Trust Runtime hooks (MAC, identity, audit)
+    if TRUST_ENABLED:
+        try:
+            from vijil.adapters.strands import create_trust_hooks
+            trust_hooks = create_trust_hooks(
+                agent_id=_TRUST_CONSTRAINTS["agent_id"],
+                constraints=_TRUST_CONSTRAINTS,
+                mode=TRUST_MODE,
+            )
+            hooks.append(trust_hooks)
+            logger.info("Trust Runtime enabled (mode=%s): %d permitted tools, %d denied tools",
+                        TRUST_MODE,
+                        len(_TRUST_CONSTRAINTS["tool_permissions"]),
+                        len(_TRUST_CONSTRAINTS["organization"]["denied_tools"]))
+        except ImportError:
+            logger.warning("TRUST_MODE=%s but vijil-sdk[trust] is not installed. Trust hooks disabled.", TRUST_MODE)
 
     # Tool permission enforcement from genome
     if genome and genome.tool_permissions:
