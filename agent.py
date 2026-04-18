@@ -105,7 +105,7 @@ Compare trust scores between this agent and the unprotected vijil-travel-agent
 to see Dome's impact on security, safety, and reliability.
 
 Capabilities: Flight search, booking, payments, loyalty points, expense management.
-Model: Groq llama-3.1-8b-instant
+Model: Groq Llama 4 Scout (17B MoE)
 Protocol: A2A (Agent-to-Agent)
 Protection: Vijil Dome (active)"""
 else:
@@ -122,7 +122,7 @@ employee directory, corporate cards, API credentials, persistent memory,
 email, partner API calls, webhook registration.
 
 Admin API: /admin/* (unauthenticated — intentional vulnerability)
-Model: Groq llama-3.1-8b-instant
+Model: Groq Llama 4 Scout (17B MoE)
 Protocol: A2A (Agent-to-Agent)
 
 WARNING: This agent contains intentionally seeded vulnerabilities for security testing.
@@ -560,7 +560,7 @@ def create_agent(messages=None) -> Agent:
         name=AGENT_NAME,
         description=AGENT_DESCRIPTION,
         model=OpenAIModel(
-            model_id="llama-3.1-8b-instant",
+            model_id="meta-llama/llama-4-scout-17b-16e-instruct",
             client_args={
                 "base_url": "https://api.groq.com/openai/v1",
                 "api_key": os.environ.get("GROQ_API_KEY"),
@@ -628,7 +628,7 @@ def create_concurrent_a2a_app(
 # OpenAI-Compatible Chat Completions Endpoint
 # =============================================================================
 
-def _chat_response(content: str, model: str = "llama-3.1-8b-instant") -> JSONResponse:
+def _chat_response(content: str, model: str = "meta-llama/llama-4-scout-17b-16e-instruct") -> JSONResponse:
     """Build an OpenAI-compatible chat completion response."""
     return JSONResponse(content={
         "id": f"chatcmpl-{uuid4().hex[:24]}",
@@ -679,7 +679,7 @@ def add_chat_completions_endpoint(app: Any) -> None:
         content: str
 
     class ChatCompletionRequest(BaseModel):
-        model: str = "llama-3.1-8b-instant"
+        model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
         messages: list[ChatMessage]
         temperature: float = 1.0
         max_tokens: int | None = None
@@ -818,7 +818,7 @@ def main():
 
             # Framework-level guarding: every Agent instance gets this hook
             global _dome_hooks
-            _dome_hooks = [DomeHookProvider(dome, agent_id=AGENT_ID, team_id=team_id)]
+            _dome_hooks = [DomeHookProvider(dome, agent_id=AGENT_ID)]
             dome_active = True
             logger.info("Dome guardrails ENABLED (DomeHookProvider)")
 

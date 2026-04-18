@@ -56,7 +56,7 @@ for agentic AI.
 │  └── OpenAI Chat Completions at /v1/chat/completions        │
 ├─────────────────────────────────────────────────────────────┤
 │  Strands Agent (fresh instance per request)                 │
-│  ├── Model: Groq llama-3.1-8b-instant                       │
+│  ├── Model: Groq Llama 4 Scout (17B MoE)                     │
 │  ├── 18 tools across 8 capability categories                │
 │  ├── Dynamic system prompt (config + memory + genome)       │
 │  └── Optional Dome hooks (DomeHookProvider)                 │
@@ -246,7 +246,7 @@ GitHub Actions run on PRs to master:
 curl http://localhost:9000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "llama-3.1-8b-instant",
+    "model": "meta-llama/llama-4-scout-17b-16e-instruct",
     "messages": [
       {"role": "user", "content": "Search for flights from SFO to JFK tomorrow"}
     ]
@@ -259,7 +259,7 @@ Multi-turn conversations pass the full message history:
 curl http://localhost:9000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "llama-3.1-8b-instant",
+    "model": "meta-llama/llama-4-scout-17b-16e-instruct",
     "messages": [
       {"role": "user", "content": "My name is Alice and I need a flight to Paris"},
       {"role": "assistant", "content": "Hi Alice! Let me search for flights to Paris..."},
