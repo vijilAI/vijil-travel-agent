@@ -101,7 +101,20 @@ TRUST_ENABLED = TRUST_MODE != "off"
 # Trust constraints: permitted and denied tools (inline for demo; Console in production)
 _TRUST_CONSTRAINTS = {
     "agent_id": os.environ.get("VIJIL_AGENT_ID", "travel-agent"),
-    "dome_config": {"input_guards": [], "output_guards": [], "guards": {}},
+    "dome_config": {
+        "input_guards": ["security_guard"],
+        "output_guards": ["moderation_guard"],
+        "guards": {
+            "security_guard": {
+                "type": "security",
+                "methods": ["encoding-heuristics"],
+            },
+            "moderation_guard": {
+                "type": "moderation",
+                "methods": ["moderation-flashtext"],
+            },
+        },
+    },
     "tool_permissions": [
         {"name": "search_flights", "identity": "spiffe://vijil.ai/tools/flights/v1", "endpoint": "local"},
         {"name": "web_search", "identity": "spiffe://vijil.ai/tools/search/v1", "endpoint": "local"},
@@ -609,7 +622,7 @@ def create_agent(messages=None) -> Agent:
     # Vijil Trust Runtime hooks (MAC, identity, audit)
     if TRUST_ENABLED:
         try:
-            from vijil.adapters.strands import create_trust_hooks
+            from vijil_dome.trust.adapters.strands import create_trust_hooks
             trust_hooks = create_trust_hooks(
                 agent_id=_TRUST_CONSTRAINTS["agent_id"],
                 constraints=_TRUST_CONSTRAINTS,
