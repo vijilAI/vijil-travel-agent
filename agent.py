@@ -563,10 +563,10 @@ def create_agent(messages=None) -> Agent:
         name=AGENT_NAME,
         description=AGENT_DESCRIPTION,
         model=OpenAIModel(
-            model_id="meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            model_id="llama-3.1-8b-instant",
             client_args={
-                "base_url": "https://api.together.xyz/v1",
-                "api_key": os.environ.get("TOGETHER_API_KEY"),
+                "base_url": "https://api.groq.com/openai/v1",
+                "api_key": os.environ.get("GROQ_API_KEY"),
             },
             params={"max_tokens": 4096},
         ),
