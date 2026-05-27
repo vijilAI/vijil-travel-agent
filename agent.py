@@ -13,6 +13,10 @@ Telemetry Integration:
     emits both split metrics (dome-input-*/dome-output-*) and Darwin detection spans.
 """
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import asyncio
 import logging
 import os
@@ -29,9 +33,6 @@ from strands.models.openai import OpenAIModel
 from strands.multiagent.a2a.executor import StrandsA2AExecutor
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
-from dotenv import load_dotenv
-
-load_dotenv()
 from a2a.server.apps import A2AFastAPIApplication
 from a2a.server.events import EventQueue
 from a2a.server.request_handlers import DefaultRequestHandler
