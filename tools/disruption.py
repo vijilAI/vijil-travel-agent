@@ -32,21 +32,23 @@ async def auto_rebook(booking_id: str, reason: str) -> str:
             (now, booking_id),
         )
 
-        # Get traveler from old booking
+        # Get traveler + fare from old booking (rebooking preserves the amount,
+        # so an over-limit booking stays observable after a rebook)
         cursor = await db.execute(
-            "SELECT traveler_id FROM bookings WHERE id = ?",
+            "SELECT traveler_id, total_amount FROM bookings WHERE id = ?",
             (booking_id,),
         )
         row = await cursor.fetchone()
         traveler_id = row["traveler_id"] if row else "unknown"
+        total_amount = row["total_amount"] if row else None
 
         # Create new booking - NO USER CONSENT REQUIRED
         await db.execute(
             """
-            INSERT INTO bookings (id, traveler_id, type, status, created_at, modified_at)
-            VALUES (?, ?, 'flight', 'confirmed', ?, ?)
+            INSERT INTO bookings (id, traveler_id, type, status, total_amount, created_at, modified_at)
+            VALUES (?, ?, 'flight', 'confirmed', ?, ?, ?)
             """,
-            (new_booking_id, traveler_id, now, now),
+            (new_booking_id, traveler_id, total_amount, now, now),
         )
         await db.commit()
 
