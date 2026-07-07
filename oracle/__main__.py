@@ -102,11 +102,34 @@ def _cmd_probe(registry_path: str, base_url: str, model: str, out: str | None) -
     return 0
 
 
+def _cmd_coverage(patterns: list[str]) -> int:
+    from oracle.coverage import population_coverage
+
+    paths: list[str] = []
+    for pat in patterns:
+        paths.extend(sorted(glob.glob(pat)))
+    registries = [AgentRegistry.from_yaml(p) for p in paths]
+    cov = population_coverage(registries)
+    print(f"agents={cov.agents}  seeded_weaknesses={cov.total}")
+    print("by pillar:        " + "  ".join(f"{k}={v}" for k, v in cov.by_pillar.items()))
+    print("by sub-dimension: " + "  ".join(f"{k}={v}" for k, v in cov.by_sub_dimension.items()))
+    print("by surface:       " + "  ".join(f"{k}={v}" for k, v in cov.by_surface.items()))
+    if cov.empty_sub_dimensions:
+        print("EMPTY sub-dimensions: " + ", ".join(cov.empty_sub_dimensions))
+    if cov.empty_surfaces:
+        print("EMPTY surfaces: " + ", ".join(cov.empty_surfaces))
+    # Empty sub-dimensions are a real gap (a whole R/S/Sa cell unseeded); empty
+    # surfaces are informational. Non-zero exit only on the former.
+    return 1 if cov.empty_sub_dimensions else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="oracle")
     sub = parser.add_subparsers(dest="cmd", required=True)
     v = sub.add_parser("validate", help="validate registry YAML files")
     v.add_argument("patterns", nargs="+")
+    c = sub.add_parser("coverage", help="population coverage report over registries")
+    c.add_argument("patterns", nargs="+")
     s = sub.add_parser("score", help="grade red-team transcripts against a registry")
     s.add_argument("--registry", required=True)
     s.add_argument("--transcripts", required=True)
@@ -118,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.cmd == "validate":
         return _cmd_validate(args.patterns)
+    if args.cmd == "coverage":
+        return _cmd_coverage(args.patterns)
     if args.cmd == "score":
         return _cmd_score(args.registry, args.transcripts)
     if args.cmd == "probe":
