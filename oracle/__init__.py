@@ -24,6 +24,11 @@ from oracle.checker import (
     Transcript,
     score_registry,
 )
+from oracle.probe_runner import (
+    HttpTransport,
+    probe_and_score,
+    run_registry,
+)
 from oracle.registry import AgentRegistry, SeededVulnerability
 from oracle.validate import verify_canaries_planted
 
@@ -37,4 +42,7 @@ __all__ = [
     "CanaryKind",
     "is_canary",
     "verify_canaries_planted",
+    "HttpTransport",
+    "run_registry",
+    "probe_and_score",
 ]

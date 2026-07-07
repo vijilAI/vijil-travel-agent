@@ -9,11 +9,16 @@ Usage:
   python -m oracle score --registry agents/claims_processing/vulnerabilities.yaml \
       --transcripts run.json
 
+  # Drive probes against a running agent and grade live (needs the agent up):
+  python -m oracle probe --registry agents/claims_processing/vulnerabilities.yaml \
+      --base-url http://localhost:8080
+
 Exit code is non-zero when validation finds issues, so this is CI-usable.
 """
 from __future__ import annotations
 
 import argparse
+import asyncio
 import glob
 import json
 import sys
@@ -66,6 +71,37 @@ def _cmd_score(registry_path: str, transcripts_path: str) -> int:
     return 0
 
 
+def _print_report(report) -> None:
+    print(f"agent={report.agent}  disclosed={report.disclosed}/{report.total} "
+          f"({report.disclosure_rate:.0%})")
+    for pillar, cell in sorted(report.by_dimension.items()):
+        print(f"  {pillar:12s} {cell['disclosed']}/{cell['total']}")
+    if report.missed_ids:
+        print("  missed: " + ", ".join(report.missed_ids))
+
+
+def _cmd_probe(registry_path: str, base_url: str, model: str, out: str | None) -> int:
+    from oracle.probe_runner import HttpTransport, run_registry
+
+    registry = AgentRegistry.from_yaml(registry_path)
+
+    async def _run():
+        transport = HttpTransport(base_url, model=model)
+        try:
+            transcripts = await run_registry(registry, transport)
+        finally:
+            await transport.aclose()
+        return transcripts
+
+    transcripts = asyncio.run(_run())
+    if out:
+        with open(out, "w") as fh:
+            json.dump({pid: t.model_dump() for pid, t in transcripts.items()}, fh, indent=2)
+    report = score_registry(registry, transcripts)
+    _print_report(report)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="oracle")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -74,11 +110,18 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("score", help="grade red-team transcripts against a registry")
     s.add_argument("--registry", required=True)
     s.add_argument("--transcripts", required=True)
+    p = sub.add_parser("probe", help="drive probes against a running agent and grade live")
+    p.add_argument("--registry", required=True)
+    p.add_argument("--base-url", required=True)
+    p.add_argument("--model", default="probe")
+    p.add_argument("--out", default=None, help="optional path to write transcripts JSON")
     args = parser.parse_args(argv)
     if args.cmd == "validate":
         return _cmd_validate(args.patterns)
     if args.cmd == "score":
         return _cmd_score(args.registry, args.transcripts)
+    if args.cmd == "probe":
+        return _cmd_probe(args.registry, args.base_url, args.model, args.out)
     return 2  # pragma: no cover
 
 
