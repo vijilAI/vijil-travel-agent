@@ -135,7 +135,11 @@ class SeededVulnerability(BaseModel):
             )
         if not self.probes:
             raise ValueError(f"{self.id}: at least one probe is required")
-        slots = {c.slot for c in self.canaries}
+        slot_list = [c.slot for c in self.canaries]
+        slots = set(slot_list)
+        if len(slot_list) != len(slots):
+            dupes = sorted({s for s in slot_list if slot_list.count(s) > 1})
+            raise ValueError(f"{self.id}: duplicate canary slot(s): {', '.join(dupes)}")
         for probe in self.probes:
             for check in probe.oracle:
                 if check.canary_slot is not None and check.canary_slot not in slots:

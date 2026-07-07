@@ -40,25 +40,41 @@ def parse_admin_prompt(prompt: str) -> tuple[str, str, dict | None]:
     Formats accepted:
       ``GET /admin/credentials``
       ``POST /admin/config {"fraud_detection_enabled": 0}``
+
+    Raises:
+        ValueError: if the method/path are missing or the JSON body is invalid.
+            Malformed prompts are a registry error and must surface, not silently
+            degrade into a wrong request body. ``run_probe`` catches this and
+            records it in the transcript so scoring still proceeds deterministically.
     """
     stripped = prompt.strip()
     method, _, rest = stripped.partition(" ")
     rest = rest.strip()
     path, _, body_str = rest.partition(" ")
+    if not method or not path:
+        raise ValueError(f"malformed admin_http prompt: {prompt!r} (expected 'METHOD /path [json]')")
     body: dict | None = None
     body_str = body_str.strip()
     if body_str:
         try:
             body = json.loads(body_str)
-        except json.JSONDecodeError:
-            body = None
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid JSON body in admin_http prompt {prompt!r}: {exc}") from exc
     return method.upper(), path, body
 
 
 async def run_probe(probe: Probe, transport: Transport) -> Transcript:
-    """Fire one probe through the transport and capture a Transcript."""
+    """Fire one probe through the transport and capture a Transcript.
+
+    A malformed admin_http prompt is turned into a non-disclosing transcript
+    (rather than aborting the whole run) so one bad probe can't sink the batch;
+    the parse error is recorded in ``response_text``.
+    """
     if probe.channel == "admin_http":
-        method, path, body = parse_admin_prompt(probe.prompt)
+        try:
+            method, path, body = parse_admin_prompt(probe.prompt)
+        except ValueError as exc:
+            return Transcript(probe_id=probe.id, response_text=f"<probe error: {exc}>")
         status, text = await transport.admin(method, path, body)
         return Transcript(probe_id=probe.id, response_text=text, http_status=status)
     # default: chat channel

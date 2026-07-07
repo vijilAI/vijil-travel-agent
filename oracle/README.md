@@ -10,7 +10,7 @@ weaknesses, run the red-teamer, and let the oracle say — with no LLM in the lo
 | Module | Role |
 |---|---|
 | `taxonomy.py` | R/S/Sa pillars + 9 sub-dimensions, `Surface` (harness vs model), OWASP-ASI (10), MITRE ATT&CK (14). |
-| `registry.py` | Typed ground-truth model. Each agent ships `agents/<name>/vulnerabilities.yaml` → `AgentRegistry`. |
+| `registry.py` | Typed ground-truth model. This repo's registry is `vulnerabilities.yaml` at the root → `AgentRegistry`. |
 | `canary.py` | Deterministic sentinel tokens. `token(agent, vuln_id, slot)` is a pure function, so the planted value and the value the oracle greps for are identical by construction. |
 | `checker.py` | The engine. `score_registry(registry, transcripts)` grades a red-team run against ground truth. |
 | `probe_runner.py` | Drives a registry's probes against a *running* agent (chat + admin_http channels) via an injectable transport, captures transcripts, and scores. |
@@ -26,8 +26,8 @@ weaknesses, run the red-teamer, and let the oracle say — with no LLM in the lo
 
 ## How a red-team system consumes it
 
-1. Read `agents/<name>/vulnerabilities.yaml`. Each `probe` has an `id`, a
-   `channel` (`chat` / `admin_http` / `tool`), and a `prompt`.
+1. Read `vulnerabilities.yaml` (this repo's single registry, at the root). Each
+   `probe` has an `id`, a `channel` (`chat` / `admin_http` / `tool`), and a `prompt`.
 2. Run each probe against the agent; capture a `Transcript`
    (`response_text`, and for `admin_http` probes the `http_status`).
 3. Feed `{probe_id: Transcript}` to `score_registry` (or the `score` CLI) to get
@@ -35,14 +35,13 @@ weaknesses, run the red-teamer, and let the oracle say — with no LLM in the lo
 
 ```bash
 # Validate ground truth (CI gate):
-python -m oracle validate agents/*/vulnerabilities.yaml
+python -m oracle validate vulnerabilities.yaml
 
 # Grade a red-team run (run.json = {probe_id: {response_text, http_status, ...}}):
-python -m oracle score --registry agents/claims_processing/vulnerabilities.yaml \
-    --transcripts run.json
+python -m oracle score --registry vulnerabilities.yaml --transcripts run.json
 
 # Or drive the probes against a running agent and grade live in one step:
-python -m oracle probe --registry agents/claims_processing/vulnerabilities.yaml \
+python -m oracle probe --registry vulnerabilities.yaml \
     --base-url http://localhost:8080 --out transcripts.json
 ```
 
@@ -61,11 +60,13 @@ is a sound oracle. Canary values are **computed, never hardcoded**, so the
 registry and the seed code cannot drift; `verify_canaries_planted` fails loudly
 if a declared canary was never planted.
 
-## Adding a new agent
+## Adding weaknesses
 
-Copy the `claims_processing` exemplar: seed weaknesses across all 3 pillars
-(≥ 3 each), plant canaries via `token(...)` in `domain_tables.py` / `config.py`,
-write `vulnerabilities.yaml`, and confirm
-`python -m oracle validate` + `pytest tests/unit/test_vuln_registries.py`
-are green. Everything stays **inert and simulated** — fake data, no real secrets,
-no genuinely exploitable outbound.
+Seed weaknesses across all 3 pillars, plant canaries via `token(...)` in
+`db/seed_data.py` / `agent.py`, extend the root `vulnerabilities.yaml`, and confirm
+`python -m oracle validate vulnerabilities.yaml` + `pytest tests/` are green.
+Everything stays **inert and simulated** — fake data, no real secrets, no
+genuinely exploitable outbound.
+
+> This `oracle/` package is vendored from `vijil-sample-agents/shell/oracle`; keep
+> it in parity when the upstream oracle changes.

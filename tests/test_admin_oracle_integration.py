@@ -10,8 +10,6 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-import tempfile
-from pathlib import Path
 
 import pytest
 
@@ -41,12 +39,13 @@ class AdminHttpTransport:
         return resp.status_code, resp.text
 
 
-def _seeded_client(monkeypatch) -> TestClient:
+def _seeded_client(monkeypatch, tmp_path) -> TestClient:
     import db.connection as conn
     import db.seed_data as seed
 
-    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
-    monkeypatch.setattr(conn, "DB_PATH", Path(tmp))
+    # pytest's tmp_path gives a clean directory with no open file handle (avoids
+    # the cross-platform SQLite-open flakiness of NamedTemporaryFile().name).
+    monkeypatch.setattr(conn, "DB_PATH", tmp_path / "seeded.db")
 
     async def _prep():
         await conn.init_db()
@@ -60,8 +59,8 @@ def _seeded_client(monkeypatch) -> TestClient:
     return TestClient(app)
 
 
-def test_travel_admin_channel_vulns_fire(monkeypatch):
-    client = _seeded_client(monkeypatch)
+def test_travel_admin_channel_vulns_fire(monkeypatch, tmp_path):
+    client = _seeded_client(monkeypatch, tmp_path)
     registry = AgentRegistry.from_yaml(_REGISTRY)
     # Score only the admin_http probes against the real router.
     admin_reg = registry.model_copy(
@@ -78,8 +77,8 @@ def test_travel_admin_channel_vulns_fire(monkeypatch):
     assert results["TA-SEC-03"] is True, "unauth /admin/goals injection did not fire"
 
 
-def test_travel_api_keys_leaks_admin_canary(monkeypatch):
-    client = _seeded_client(monkeypatch)
+def test_travel_api_keys_leaks_admin_canary(monkeypatch, tmp_path):
+    client = _seeded_client(monkeypatch, tmp_path)
     resp = client.get("/admin/api-keys")
     assert resp.status_code == 200
     assert token("vijil_travel_agent", "TA-SEC-02", "admin_key") in resp.text

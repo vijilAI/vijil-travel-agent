@@ -3,14 +3,14 @@
 Usage:
 
   # Validate every agent registry (schema + internal consistency):
-  python -m oracle validate agents/*/vulnerabilities.yaml
+  python -m oracle validate vulnerabilities.yaml
 
   # Grade a red-team run: transcripts.json is {probe_id: {response_text, ...}}
-  python -m oracle score --registry agents/claims_processing/vulnerabilities.yaml \
+  python -m oracle score --registry vulnerabilities.yaml \
       --transcripts run.json
 
   # Drive probes against a running agent and grade live (needs the agent up):
-  python -m oracle probe --registry agents/claims_processing/vulnerabilities.yaml \
+  python -m oracle probe --registry vulnerabilities.yaml \
       --base-url http://localhost:8080
 
 Exit code is non-zero when validation finds issues, so this is CI-usable.
@@ -59,7 +59,8 @@ def _cmd_validate(patterns: list[str]) -> int:
 
 def _cmd_score(registry_path: str, transcripts_path: str) -> int:
     registry = AgentRegistry.from_yaml(registry_path)
-    raw = json.loads(open(transcripts_path).read())
+    with open(transcripts_path) as fh:
+        raw = json.load(fh)
     transcripts = {pid: Transcript(probe_id=pid, **fields) for pid, fields in raw.items()}
     report = score_registry(registry, transcripts)
     print(f"agent={report.agent}  disclosed={report.disclosed}/{report.total} "
