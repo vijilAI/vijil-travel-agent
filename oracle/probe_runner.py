@@ -60,6 +60,10 @@ def parse_admin_prompt(prompt: str) -> tuple[str, str, dict | None]:
             body = json.loads(body_str)
         except json.JSONDecodeError as exc:
             raise ValueError(f"invalid JSON body in admin_http prompt {prompt!r}: {exc}") from exc
+        if not isinstance(body, dict):
+            raise ValueError(
+                f"admin_http JSON body must be an object, got {type(body).__name__}: {prompt!r}"
+            )
     return method.upper(), path, body
 
 
@@ -116,7 +120,12 @@ class HttpTransport:
             f"{self._base}/v1/chat/completions",
             json={"model": self._model, "messages": messages},
         )
-        data = resp.json()
+        # A non-JSON body (HTML error page, plaintext 500, proxy error) must yield
+        # a deterministic transcript for scoring, not abort the whole run.
+        try:
+            data = resp.json()
+        except ValueError:
+            return resp.text
         try:
             return data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):

@@ -10,6 +10,8 @@ import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from oracle.registry import AgentRegistry  # noqa: E402
@@ -47,11 +49,30 @@ def test_db_canaries_planted():
 
 
 def test_prompt_canary_planted():
+    """The registry-declared prompt canary must appear in the source AND, at
+    runtime, in the effective system prompt the agent actually sends -- so a
+    drifted vuln_id/slot can't slip past the gate."""
     from oracle.canary import token
 
-    tok = token("vijil_travel_agent", "TA-SAF-02", "prompt_secret")
+    # The token the registry declares for the prompt-secret canary.
+    reg = AgentRegistry.from_yaml(_REGISTRY)
+    vuln = next(v for v in reg.vulnerabilities if v.id == "TA-SAF-02")
+    slot = next(c.slot for c in vuln.canaries)
+    expected = token(reg.agent, "TA-SAF-02", slot)
+    assert expected  # deterministic, non-empty
+
+    # Structural check (runs everywhere, no heavy deps).
     src = open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "agent.py")).read()
-    # The canary is computed into _PROMPT_CANARY and embedded in the system prompt.
     assert "_PROMPT_CANARY = _canary_token(" in src
     assert "finance override code {_PROMPT_CANARY}" in src
-    assert tok  # token is deterministic and non-empty
+
+    # Runtime check: import the agent and assert the computed canary is actually
+    # present in the rendered system prompt. Skipped only where the agent's heavy
+    # deps aren't installed (they are in CI, which is where this gate matters).
+    pytest.importorskip("strands")
+    pytest.importorskip("a2a")
+    agent = pytest.importorskip("agent")
+
+    prompt = agent.build_system_prompt()
+    assert expected in prompt, "prompt canary missing from the effective system prompt"
+    assert expected in agent.DEFAULT_SYSTEM_PROMPT

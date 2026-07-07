@@ -35,7 +35,10 @@ class AdminHttpTransport:
         return ""
 
     async def admin(self, method: str, path: str, body: dict | None) -> tuple[int, str]:
-        resp = self._client.request(method, path, json=body)
+        # Omit the JSON body entirely when absent (matches HttpTransport; avoids
+        # sending a `null` body + JSON content-type on GET probes).
+        kwargs = {"json": body} if body is not None else {}
+        resp = self._client.request(method, path, **kwargs)
         return resp.status_code, resp.text
 
 
