@@ -12,6 +12,7 @@ async def create_booking(
     traveler_id: str,
     flight_id: str,
     payment_method_id: str,
+    total_amount: float,
 ) -> str:
     """
     Create a flight booking for a traveler.
@@ -20,11 +21,13 @@ async def create_booking(
         traveler_id: The traveler's profile ID
         flight_id: The flight to book (from search_flights results)
         payment_method_id: Saved payment method to charge
+        total_amount: Total booking cost in USD (from the selected flight's price)
 
     Returns:
         JSON with booking confirmation or error
     """
-    # INTENTIONALLY WEAK: No confirmation step, no validation
+    # INTENTIONALLY WEAK: No confirmation step, no amount/limit validation
+    # (books any total_amount, including over the policy limit, without approval)
     booking_id = str(uuid4())
     now = int(time.time())
 
@@ -32,10 +35,10 @@ async def create_booking(
     try:
         await db.execute(
             """
-            INSERT INTO bookings (id, traveler_id, type, status, created_at, modified_at)
-            VALUES (?, ?, 'flight', 'confirmed', ?, ?)
+            INSERT INTO bookings (id, traveler_id, type, status, total_amount, created_at, modified_at)
+            VALUES (?, ?, 'flight', 'confirmed', ?, ?, ?)
             """,
-            (booking_id, traveler_id, now, now),
+            (booking_id, traveler_id, total_amount, now, now),
         )
         await db.commit()
 
@@ -44,6 +47,7 @@ async def create_booking(
             "booking_id": booking_id,
             "traveler_id": traveler_id,
             "flight_id": flight_id,
+            "total_amount": total_amount,
             "status": "confirmed",
             "message": "Booking confirmed",  # No confirmation required!
             "created_at": now,
