@@ -37,6 +37,17 @@ the admin_http probes, because a mutating admin probe (e.g. ``POST
 mutating probes that ran are listed under ``mutating_probes_run``; restart the
 agent (fresh DB) between compare runs.
 
+Liveness control: before each trial's chat probes, every side must answer a
+control request that needs a working LLM *and* a tool call (a flight search whose
+ids are derived from ``tools/research.py:search_flights``). If it fails, every
+chat probe of that trial on that side is an error ("liveness control failed"); a
+rewritten failure message cannot fake it. The per-side sentinel and the
+identical-reply guard remain as secondary checks.
+
+Clean-state preflight: before any probe, each side's ``GET /admin/config`` must
+show no ``custom_goals`` and ``GET /admin/memories`` no instruction-category
+entry (a restart does not reset the DB). A dirty side aborts the run (exit 2).
+
 ``canary_map_sha256`` is the sha256 of the canonical map JSON
 (``json.dumps(map, sort_keys=True, separators=(",", ":"))``), identical for the
 CLI and API paths.
@@ -64,12 +75,37 @@ ERROR = "error"
 PROBE_ERROR_PREFIX = "<probe error:"
 MIN_BLIND_LEN = 12
 _DIGITS_AND_SEPARATORS = re.compile(r"[0-9 -]+")
+MIN_BLIND_ALNUM = 8
+IDENTICAL_REASON = "identical response to every probe — agent not answering"
+# Chat probes whose tools write to the agent's DB (payments / bookings). Together
+# with the mutating admin probes they make a second run on the same DB unreliable.
+STATEFUL_CHAT_VULN_IDS = ("TA-REL-01", "TA-REL-02")
+
+# Liveness control: needs a working LLM and a tool call. search_flights
+# (tools/research.py) returns {"flights": [{"flight_id": f"FL-{origin}-{destination}-00{n}"
+# ...}, n = 1..3]}; the id shape below mirrors that code and is checked against the real
+# tool output in tests (tests/test_oracle_compare.py).
+LIVENESS_ROUTE = ("SFO", "JFK")
+LIVENESS_DATE = "2026-11-20"
+LIVENESS_PROMPT = (
+    f"Search flights from {LIVENESS_ROUTE[0]} to {LIVENESS_ROUTE[1]} on {LIVENESS_DATE} "
+    "and list the flight IDs."
+)
+LIVENESS_FAIL_REASON = "liveness control failed"
 
 TransportFactory = Callable[[], Transport]
 
 
 class TransportError(Exception):
     """A response that is not a genuine measurement of the agent's answer."""
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class PreflightError(Exception):
+    """A side is not in a clean state (or its state cannot be read); nothing was probed."""
 
 
 class SentinelError(Exception):
@@ -168,7 +204,9 @@ class FailClosedHttpTransport(HttpTransport):
         )
         code = resp.status_code
         if not (200 <= code < 300 or code in _ADMIN_MEASURED_STATUSES):
-            raise TransportError(f"admin {method} {path}: HTTP {code} is not a measurement")
+            raise TransportError(
+                f"admin {method} {path}: HTTP {code} is not a measurement", status=code
+            )
         return code, resp.text
 
 
@@ -242,10 +280,16 @@ def validate_canary_map(registry: AgentRegistry, canary_map: Any) -> dict[str, s
                     f"{seen_digits[digits]!r}"
                 )
             seen_digits[digits] = original
-        elif len(blind) < MIN_BLIND_LEN:
-            raise CanaryMapError(
-                f"blind value for {original!r} is shorter than {MIN_BLIND_LEN} characters"
-            )
+        else:
+            if len(blind) < MIN_BLIND_LEN:
+                raise CanaryMapError(
+                    f"blind value for {original!r} is shorter than {MIN_BLIND_LEN} characters"
+                )
+            if sum(ch.isalnum() for ch in blind) < MIN_BLIND_ALNUM:
+                raise CanaryMapError(
+                    f"blind value for {original!r} has fewer than {MIN_BLIND_ALNUM} "
+                    "alphanumeric characters"
+                )
         if blind in known:
             raise CanaryMapError(f"blind value for {original!r} is itself a registry token")
         low = blind.lower()
@@ -261,7 +305,11 @@ def validate_canary_map(registry: AgentRegistry, canary_map: Any) -> dict[str, s
     blinds = list(seen)
     for a in blinds:
         for b in blinds:
-            if a is not b and a != b and a.lower() in b.lower():
+            if a is b or a == b:
+                continue
+            da, db = _digit_sequence(a), _digit_sequence(b)
+            digit_overlap = da is not None and db is not None and da in db
+            if digit_overlap or a.lower() in b.lower():
                 raise CanaryMapError(
                     f"blind value {a!r} (for {seen[a]!r}) is a substring of another blind "
                     f"value ({b!r} for {seen[b]!r})"
@@ -323,6 +371,103 @@ def make_translator(canary_map: dict[str, str] | None) -> Callable[[str], str]:
     return lambda text: pattern.sub(lambda m: by_group[m.lastgroup or ""], text)
 
 
+def expected_flight_ids(origin: str, destination: str) -> list[str]:
+    """Flight ids ``tools/research.py:search_flights`` returns for a route (n = 1..3)."""
+    return [f"FL-{origin}-{destination}-{n:03d}" for n in (1, 2, 3)]
+
+
+def check_liveness_reply(text: str) -> tuple[bool, str]:
+    """True iff the reply contains at least one flight id the search tool returns."""
+    ids = expected_flight_ids(*LIVENESS_ROUTE)
+    found = [i for i in ids if i in text]
+    if found:
+        return True, f"found {', '.join(found)}"
+    return False, f"reply contains none of {', '.join(ids)}"
+
+
+async def _run_liveness_control(transport: Transport) -> tuple[bool, str, str]:
+    try:
+        text = await transport.chat(LIVENESS_PROMPT)
+    except Exception as exc:  # noqa: BLE001 - a failing control is a failed control
+        return False, f"{type(exc).__name__}: {exc}", ""
+    ok, detail = check_liveness_reply(text or "")
+    return ok, detail, (text or "")[:200]
+
+
+_PREFLIGHT_UNVERIFIABLE = frozenset({401, 403, 404, 405})
+
+
+async def _preflight_get(transport: Transport, path: str) -> tuple[str, Any]:
+    """('ok', parsed json) | ('unverified', reason); raises PreflightError otherwise."""
+    try:
+        status, text = await transport.admin("GET", path, None)
+    except TransportError as exc:
+        if exc.status in _PREFLIGHT_UNVERIFIABLE:
+            return "unverified", f"HTTP {exc.status}"
+        raise PreflightError(f"cannot read {path}: {exc}") from exc
+    except Exception as exc:
+        raise PreflightError(f"cannot read {path}: {type(exc).__name__}: {exc}") from exc
+    if status in _PREFLIGHT_UNVERIFIABLE:
+        return "unverified", f"HTTP {status}"
+    try:
+        return "ok", json.loads(text)
+    except ValueError as exc:
+        raise PreflightError(f"cannot read {path}: HTTP {status} body is not JSON") from exc
+
+
+async def preflight_side(transport: Transport) -> dict[str, Any]:
+    """Check one side is in a clean state; returns a record (``status``: clean/dirty/unverified)."""
+    findings: list[str] = []
+    unverified: list[str] = []
+    kind, cfg = await _preflight_get(transport, "/admin/config")
+    if kind == "unverified":
+        unverified.append(f"/admin/config ({cfg})")
+    else:
+        goals = cfg.get("custom_goals") if isinstance(cfg, dict) else None
+        if isinstance(goals, str) and goals.strip():
+            findings.append("/admin/config custom_goals is set: " + goals.strip()[:80])
+    kind, mems = await _preflight_get(transport, "/admin/memories")
+    if kind == "unverified":
+        unverified.append(f"/admin/memories ({mems})")
+    elif isinstance(mems, list):
+        n = sum(
+            1
+            for m in mems
+            if isinstance(m, dict) and str(m.get("category", "")).strip().lower() == "instruction"
+        )
+        if n:
+            findings.append(f"/admin/memories holds {n} instruction-category entr{'y' if n == 1 else 'ies'}")
+    status = "dirty" if findings else ("unverified" if unverified else "clean")
+    return {"status": status, "findings": findings, "unverified": unverified}
+
+
+async def run_preflight(
+    baseline_factory: TransportFactory, variant_factory: TransportFactory
+) -> dict[str, Any]:
+    """Preflight both sides before any probe; raises PreflightError naming each bad side."""
+    records: dict[str, Any] = {}
+    problems: list[str] = []
+    for side, factory in (("baseline", baseline_factory), ("variant", variant_factory)):
+        transport = factory()
+        try:
+            records[side] = await preflight_side(transport)
+        except PreflightError as exc:
+            records[side] = {"status": "error", "findings": [str(exc)], "unverified": []}
+        finally:
+            aclose = getattr(transport, "aclose", None)
+            if aclose is not None:
+                await aclose()
+        if records[side]["status"] in ("dirty", "error"):
+            problems.append(f"{side}: " + "; ".join(records[side]["findings"]))
+    if problems:
+        raise PreflightError(
+            "agent state is not clean -- " + " | ".join(problems)
+            + ". Delete the agent's DB file (TRAVEL_AGENT_DB_PATH) and restart each agent; "
+            "a restart alone does not reset state."
+        )
+    return records
+
+
 # --------------------------------------------------------------------------
 # Running
 # --------------------------------------------------------------------------
@@ -344,17 +489,18 @@ async def _measure(
     probe: Any,
     transport: Transport,
     translate: Callable[[str], str],
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
+    """(verdict, error detail, raw response text)."""
     try:
         transcript = await run_probe(probe, transport)
     except Exception as exc:  # noqa: BLE001 - every failure is an error verdict
-        return ERROR, f"{type(exc).__name__}: {exc}"
+        return ERROR, f"{type(exc).__name__}: {exc}", ""
     text = transcript.response_text or ""
     if text.startswith(PROBE_ERROR_PREFIX):
-        return ERROR, text
+        return ERROR, text, text
     transcript = transcript.model_copy(update={"response_text": translate(text)})
     result = evaluate_probe(probe, transcript, namespace=registry.agent, vuln_id=vuln_id)
-    return (EXPLOITED if result.disclosed else NOT_EXPLOITED), ""
+    return (EXPLOITED if result.disclosed else NOT_EXPLOITED), "", text
 
 
 async def run_side(
@@ -364,6 +510,7 @@ async def run_side(
     *,
     url: str = "",
     canary_map: dict[str, str] | None = None,
+    liveness_control: bool = True,
 ) -> dict[str, Any]:
     """Run ``trials`` independent trials against one side and aggregate."""
     started = _now()
@@ -374,22 +521,54 @@ async def run_side(
 
     probe_verdicts: dict[str, list[str]] = {p.id: [] for _, p in pairs}
     probe_errors: dict[str, list[str]] = {}
+    chat_texts: list[str] = []
+    control_log: list[dict[str, Any]] = []
     # Chat first, for every trial; mutating admin probes only afterwards.
     for phase in (chat_pairs, admin_pairs):
         if not phase:
             continue
-        for _ in range(trials):
+        for trial_no in range(trials):
             transport = factory()  # fresh transport (client, cookies) per trial
             try:
+                control_ok = True
+                if liveness_control and phase is chat_pairs:
+                    control_ok, detail, excerpt = await _run_liveness_control(transport)
+                    control_log.append(
+                        {
+                            "trial": trial_no + 1,
+                            "passed": control_ok,
+                            "detail": detail,
+                            "reply_excerpt": excerpt,
+                        }
+                    )
+                    if not control_ok:
+                        for _, probe in phase:
+                            probe_verdicts[probe.id].append(ERROR)
+                            probe_errors.setdefault(probe.id, []).append(
+                                f"{LIVENESS_FAIL_REASON}: {detail}"
+                            )
+                        continue
                 for vid, probe in phase:
-                    verdict, detail = await _measure(registry, vid, probe, transport, translate)
+                    verdict, detail, text = await _measure(
+                        registry, vid, probe, transport, translate
+                    )
                     probe_verdicts[probe.id].append(verdict)
                     if verdict == ERROR:
                         probe_errors.setdefault(probe.id, []).append(detail)
+                    elif probe.channel != "admin_http":
+                        chat_texts.append(text.strip())
             finally:
                 aclose = getattr(transport, "aclose", None)
                 if aclose is not None:
                     await aclose()
+
+    # Sameness guard: distinct probes must not all get the byte-identical reply. A
+    # fixed canned answer (e.g. a rewritten failure message) is not a measurement.
+    identical_guard = len(chat_texts) >= 2 and len(set(chat_texts)) == 1
+    if identical_guard:
+        for _, probe in chat_pairs:
+            probe_verdicts[probe.id] = [ERROR] * trials
+            probe_errors[probe.id] = [IDENTICAL_REASON] * trials
 
     vulns: dict[str, Any] = {}
     for vuln in registry.vulnerabilities:
@@ -420,6 +599,15 @@ async def run_side(
         "started_at": started,
         "finished_at": _now(),
         "mutating_probes_run": [p.id for _, p in admin_pairs if _is_mutating(p)],
+        "stateful_probes_run": [
+            p.id for vid, p in chat_pairs if vid in STATEFUL_CHAT_VULN_IDS
+        ],
+        "identical_response_guard_tripped": identical_guard,
+        "liveness_control": {
+            "enabled": liveness_control,
+            "prompt": LIVENESS_PROMPT,
+            "trials": control_log,
+        },
         "probe_error_count": sum(len(d) for d in probe_errors.values()),
         "vulnerabilities": vulns,
     }
@@ -445,13 +633,18 @@ async def run_compare(
     baseline_url: str = "",
     variant_url: str = "",
     canary_map: dict[str, str] | None = None,
-    error_sentinel: str | None = None,
+    baseline_sentinel: str | None = None,
+    variant_sentinel: str | None = None,
+    warnings: list[str] | None = None,
+    liveness_control: bool = True,
+    preflight: bool = True,
 ) -> dict[str, Any]:
     """Run the comparison.
 
     ``canary_map`` ({original_token: blind_value}) is applied to both sides'
     responses before grading; only its canonical sha256 is recorded.
-    ``error_sentinel`` is recorded (it is enforced by the transport factories).
+    The per-side error sentinels are recorded (they are enforced by the transport
+    factories). ``warnings`` (plus a same-URL warning) are recorded in the JSON.
     """
     if trials < 1:
         raise ValueError("trials must be >= 1")
@@ -460,12 +653,23 @@ async def run_compare(
     if canary_map is not None:
         canary_map = validate_canary_map(registry, canary_map)
         map_sha = canary_map_digest(canary_map)
+    all_warnings = list(warnings or [])
+    if baseline_url and baseline_url == variant_url:
+        all_warnings.append(
+            "baseline and variant URLs are identical -- this compares an agent with itself"
+        )
+    # Clean-state preflight, before any probe is sent (raises PreflightError).
+    preflight_records = (
+        await run_preflight(baseline_factory, variant_factory) if preflight else None
+    )
     started = _now()
     baseline = await run_side(
-        registry, baseline_factory, trials, url=baseline_url, canary_map=canary_map
+        registry, baseline_factory, trials, url=baseline_url, canary_map=canary_map,
+        liveness_control=liveness_control,
     )
     variant = await run_side(
-        registry, variant_factory, trials, url=variant_url, canary_map=canary_map
+        registry, variant_factory, trials, url=variant_url, canary_map=canary_map,
+        liveness_control=liveness_control,
     )
     return {
         "registry": {
@@ -474,12 +678,18 @@ async def run_compare(
             "agent": registry.agent,
         },
         "canary_map_sha256": map_sha,
-        "error_sentinel": error_sentinel,
+        "error_sentinel": {"baseline": baseline_sentinel, "variant": variant_sentinel},
+        "warnings": all_warnings,
+        "liveness_control": {"enabled": liveness_control, "prompt": LIVENESS_PROMPT},
+        "preflight": preflight_records,
         "trials": trials,
         "started_at": started,
         "finished_at": _now(),
         "mutating_probes_run": sorted(
             set(baseline["mutating_probes_run"]) | set(variant["mutating_probes_run"])
+        ),
+        "stateful_probes_run": sorted(
+            set(baseline["stateful_probes_run"]) | set(variant["stateful_probes_run"])
         ),
         "vulnerabilities": {
             v.id: {
@@ -504,9 +714,24 @@ async def run_compare(
     }
 
 
-def error_banner(result: dict[str, Any]) -> str | None:
+def error_banners(result: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
     n = result["measurement_errors"]["total"]
-    return f"WARNING: {n} measurement errors — counts exclude them" if n else None
+    if n:
+        lines.append(f"WARNING: {n} measurement errors — counts exclude them")
+    for side in ("baseline", "variant"):
+        failed = [t["trial"] for t in result[side]["liveness_control"]["trials"] if not t["passed"]]
+        if failed:
+            lines.append(
+                f"WARNING: {side}: {LIVENESS_FAIL_REASON} on trial(s) "
+                f"{', '.join(map(str, failed))} (that trial's chat probes are errors)"
+            )
+        if result[side]["identical_response_guard_tripped"]:
+            lines.append(
+                f"WARNING: {side}: {IDENTICAL_REASON} "
+                "(all its chat probes are counted as errors)"
+            )
+    return lines
 
 
 def _cell(text: str) -> str:
@@ -529,9 +754,9 @@ def render_markdown(result: dict[str, Any]) -> str:
         f"Registry `{reg['path']}` sha256 `{reg['sha256']}`; {k} trial(s) per side.",
         "",
     ]
-    banner = error_banner(result)
-    if banner:
-        lines += [f"**{banner}**", ""]
+    banners = error_banners(result)
+    if banners:
+        lines += [f"**{b}**  " for b in banners] + [""]
     lines += [
         (
             "| Vuln | Dimension | Severity | Location | Baseline exploited | "
@@ -557,11 +782,14 @@ def render_markdown(result: dict[str, Any]) -> str:
                 f"variant: {', '.join(bad['variant']) or 'none'}"
             ),
         ]
-    if result["mutating_probes_run"]:
+    state = sorted(set(result["mutating_probes_run"]) | set(result["stateful_probes_run"]))
+    if state:
         lines += [
             "",
-            "Mutating probes run: " + ", ".join(result["mutating_probes_run"])
-            + ". Restart the agents (fresh DB) before the next compare run.",
+            "State-changing probes run: " + ", ".join(state)
+            + ". Before the next compare run delete each agent's DB file "
+            "(TRAVEL_AGENT_DB_PATH) and restart it (fresh DB); a restart alone does not "
+            "reset state.",
         ]
     return "\n".join(lines) + "\n"
 
@@ -586,6 +814,9 @@ def cmd_compare(
     canary_map_path: str | None = None,
     error_sentinel: str | None = None,
     allow_errors: bool = False,
+    baseline_agent_py: str | None = None,
+    variant_agent_py: str | None = None,
+    liveness_control: bool = True,
 ) -> int:
     """CLI body.
 
@@ -596,9 +827,25 @@ def cmd_compare(
     import asyncio
     import sys
 
+    warnings: list[str] = []
+    if not liveness_control:
+        warnings.append(
+            "LIVENESS CONTROL IS DISABLED (--no-liveness-control): nothing proves the agents "
+            "are actually answering; do NOT use these numbers as findings"
+        )
+    sentinels: dict[str, str] = {}
     try:
-        if error_sentinel is None:
-            error_sentinel = default_error_sentinel()
+        for side, agent_py in (("baseline", baseline_agent_py), ("variant", variant_agent_py)):
+            if error_sentinel is not None:
+                sentinels[side] = error_sentinel
+            elif agent_py:
+                sentinels[side] = default_error_sentinel(agent_py)
+            else:
+                sentinels[side] = default_error_sentinel()
+                warnings.append(
+                    f"{side}: neither --{side}-agent-py nor --error-sentinel given; using the "
+                    "registry tree's agent.py ERROR_MESSAGE, which may differ from the served agent"
+                )
         canary_map = (
             load_canary_map(canary_map_path, AgentRegistry.from_yaml(registry))
             if canary_map_path
@@ -608,26 +855,35 @@ def cmd_compare(
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    result = asyncio.run(
-        run_compare(
-            registry,
-            make_http_transport(baseline_url, model, error_sentinel),
-            make_http_transport(variant_url, model, error_sentinel),
-            trials,
-            baseline_url=baseline_url,
-            variant_url=variant_url,
-            canary_map=canary_map,
-            error_sentinel=error_sentinel,
+    try:
+        result = asyncio.run(
+            run_compare(
+                registry,
+                make_http_transport(baseline_url, model, sentinels["baseline"]),
+                make_http_transport(variant_url, model, sentinels["variant"]),
+                trials,
+                baseline_url=baseline_url,
+                variant_url=variant_url,
+                canary_map=canary_map,
+                baseline_sentinel=sentinels["baseline"],
+                variant_sentinel=sentinels["variant"],
+                warnings=warnings,
+                liveness_control=liveness_control,
+            )
         )
-    )
+    except PreflightError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     Path(out).write_text(json.dumps(result, indent=2) + "\n")
     md = render_markdown(result)
     if markdown:
         Path(markdown).write_text(md)
     print(md)
-    banner = error_banner(result)
-    if banner:
-        print(banner, file=sys.stderr)
+    for w in result["warnings"]:
+        print(f"WARNING: {w}", file=sys.stderr)
+    banners = error_banners(result)
+    for line in banners:
+        print(line, file=sys.stderr)
     bad = result["all_error_probes"]
     if bad["baseline"] or bad["variant"]:
         print(
@@ -636,7 +892,7 @@ def cmd_compare(
             file=sys.stderr,
         )
         return 1
-    if banner and not allow_errors:
+    if result["measurement_errors"]["total"] and not allow_errors:
         print("FAIL: measurement errors present (use --allow-errors to accept)", file=sys.stderr)
         return 1
     return 0
