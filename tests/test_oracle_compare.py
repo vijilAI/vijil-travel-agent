@@ -7,6 +7,7 @@ vulnerability are asserted exactly, and transport failures must land in
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import subprocess
@@ -31,11 +32,16 @@ _ALL_IDS = [v.id for v in _REG.vulnerabilities]
 _ALL_PROBES = [p.id for v in _REG.vulnerabilities for p in v.probes]
 
 
+def _tag(prompt):
+    """Per-prompt suffix so distinct probes get distinct replies (sameness guard)."""
+    return " [" + hashlib.sha1(prompt.encode()).hexdigest()[:8] + "]"
+
+
 class LeakyTransport:
     """Baseline: leaks every canary, complies, admin endpoints answer 200."""
 
     async def chat(self, prompt, system_prompt=None):
-        return f"Sure! 9,999,999 booked. {_ALL_CANARIES}"
+        return f"Sure! 9,999,999 booked. {_ALL_CANARIES}" + _tag(prompt)
 
     async def admin(self, method, path, body):
         return 200, _ALL_CANARIES
@@ -45,7 +51,10 @@ class SecureTransport:
     """Variant: refuses in chat (and says confirm/simulated); admin is 403."""
 
     async def chat(self, prompt, system_prompt=None):
-        return "I can't help with that. I cannot. I'm not able. Please confirm; this is simulated."
+        return (
+            "I can't help with that. I cannot. I'm not able. Please confirm; this is simulated."
+            + _tag(prompt)
+        )
 
     async def admin(self, method, path, body):
         return 403, "forbidden"
@@ -146,6 +155,15 @@ def _mock_factory(chat_resp, admin_resp, sentinel=_SENTINEL):
     def handler(request):
         resp = chat_resp if request.url.path == "/v1/chat/completions" else admin_resp
         status, body = resp
+        if (
+            request.url.path == "/v1/chat/completions"
+            and isinstance(body, dict)
+            and "error" not in body
+        ):
+            content = ((body.get("choices") or [{}])[0].get("message") or {}).get("content")
+            if isinstance(content, str) and content.strip() and content != sentinel:
+                prompt = json.loads(request.content)["messages"][-1]["content"]
+                body = {"choices": [{"message": {"content": content + _tag(prompt)}}]}
         if isinstance(body, (dict, list)):
             return httpx.Response(status, json=body)
         return httpx.Response(status, text=body)
@@ -227,14 +245,16 @@ def test_admin_200_leak_is_exploited():
     assert side["vulnerabilities"]["TA-SEC-03"]["exploited"] == 1
 
 
-def test_sentinel_recorded_in_json():
+def test_sentinels_recorded_per_side_in_json():
     res = asyncio.run(
         compare.run_compare(
             _REGISTRY, lambda: LeakyTransport(), lambda: SecureTransport(), 1,
-            error_sentinel="custom failure reply",
+            baseline_sentinel="base failure reply", variant_sentinel="variant failure reply",
         )
     )
-    assert res["error_sentinel"] == "custom failure reply"
+    assert res["error_sentinel"] == {
+        "baseline": "base failure reply", "variant": "variant failure reply",
+    }
 
 
 def test_markdown_row_content_and_error_rendering():
@@ -317,7 +337,8 @@ def test_cli_any_error_exits_1_with_stderr_banner_unless_allow_errors(
         assert "WARNING: 1 measurement errors — counts exclude them" in captured.err
         assert "WARNING: 1 measurement errors" in (tmp_path / "out.md").read_text()
         data = json.loads((tmp_path / "out.json").read_text())
-        assert data["error_sentinel"] == compare.default_error_sentinel()
+        default = compare.default_error_sentinel()
+        assert data["error_sentinel"] == {"baseline": default, "variant": default}
         assert data["measurement_errors"]["total"] == 1
 
 
@@ -371,7 +392,7 @@ class BlindLeakyTransport(LeakyTransport):
     """Leaks the blind (opaque) canary values, never the registry tokens."""
 
     async def chat(self, prompt, system_prompt=None):
-        return "Sure! " + " ".join(_BLIND.values())
+        return "Sure! " + " ".join(_BLIND.values()) + _tag(prompt)
 
     async def admin(self, method, path, body):
         return 200, " ".join(_BLIND.values())
@@ -477,7 +498,7 @@ def test_canary_map_validation_rules():
     with pytest.raises(compare.CanaryMapError, match="probe prompt or registry oracle"):
         _validate({**_BLIND, first: prompt_text})
     with pytest.raises(compare.CanaryMapError, match="probe prompt or registry oracle"):
-        _validate({**_BLIND, first: "9[,]?999[,]?"})  # inside TA-REL-01's regex value
+        _validate({**_BLIND, first: "I'm not able"})  # TA-MODEL-01's not_contains value
     with pytest.raises(compare.CanaryMapError, match="substring of another"):
         _validate({**_BLIND, first: "BLIND-0001-opa", second: "BLIND-0001-opaque"})
     with pytest.raises(compare.CanaryMapError, match="maps to both"):
@@ -562,8 +583,10 @@ def test_reformatted_blind_values_graded_exploited_end_to_end():
 
     class Reformatting(LeakyTransport):
         async def chat(self, prompt, system_prompt=None):
-            return "Card: 4451 0144 8003 4591 and key SK_LIVE_ABC123XYZQWERTY " + " ".join(
-                _BLIND[t] for t in _CANARY_TOKENS if t not in (_TOK_CARD, _TOK_SEC01)
+            return (
+                "Card: 4451 0144 8003 4591 and key SK_LIVE_ABC123XYZQWERTY "
+                + " ".join(_BLIND[t] for t in _CANARY_TOKENS if t not in (_TOK_CARD, _TOK_SEC01))
+                + _tag(prompt)
             )
 
     res = _run_map(Reformatting(), SecureTransport(), mapping, trials=1)
@@ -673,3 +696,199 @@ def test_chat_probes_run_before_mutating_admin_probes_and_are_recorded():
     assert res["mutating_probes_run"] == ["TA-SEC-03-p1"]
     assert res["baseline"]["mutating_probes_run"] == ["TA-SEC-03-p1"]
     assert res["variant"]["mutating_probes_run"] == ["TA-SEC-03-p1"]
+
+
+# ---------------------------------------------------------------------------
+# per-side sentinels, sameness guard, map overlap, same-URL, stateful probes
+# ---------------------------------------------------------------------------
+
+
+def _agent_py(tmp_path, name, message):
+    p = tmp_path / name
+    p.write_text(f"class X:\n    ERROR_MESSAGE = ({message!r})\n")
+    return str(p)
+
+
+class FixedReplyTransport(LeakyTransport):
+    """An agent that answers every chat probe with one fixed sentence."""
+
+    def __init__(self, reply):
+        self.reply = reply
+
+    async def chat(self, prompt, system_prompt=None):
+        return self.reply
+
+    async def admin(self, method, path, body):
+        return 200, "ok"
+
+
+def test_sameness_guard_turns_identical_replies_into_errors():
+    res = asyncio.run(
+        compare.run_compare(
+            _REGISTRY, LeakyTransport,
+            lambda: FixedReplyTransport("Sorry, the service is unavailable right now."), 2,
+        )
+    )
+    for vid in _CHAT_VULNS:
+        v = res["variant"]["vulnerabilities"][vid]
+        assert (v["exploited"], v["not_exploited"], v["errors"]) == (0, 0, 2), vid
+        p = v["probes"][next(iter(v["probes"]))]
+        assert p["error_details"] == [compare.IDENTICAL_REASON] * 2
+    assert res["variant"]["identical_response_guard_tripped"] is True
+    assert res["baseline"]["identical_response_guard_tripped"] is False
+    assert any("variant" in b and "identical response" in b for b in compare.error_banners(res))
+    assert "agent not answering" in compare.render_markdown(res)
+    assert sorted(res["all_error_probes"]["variant"]) == sorted(
+        p.id for v in _REG.vulnerabilities for p in v.probes if p.channel != "admin_http"
+    )
+
+
+def test_cli_reverifier_scenario_baseline_leaks_variant_fixed_sentence_exits_1(
+    tmp_path, monkeypatch, capsys
+):
+    transports = {
+        "http://b.invalid": LeakyTransport(),
+        "http://v.invalid": FixedReplyTransport("I am unable to help with that request."),
+    }
+    monkeypatch.setattr(
+        compare, "make_http_transport",
+        lambda url, model, sentinel=None: (lambda: transports[url]),
+    )
+    rc = oracle_main.main(_cli_args(tmp_path) + ["--allow-errors"])
+    assert rc == 1  # chat probes errored on every trial: exits 1 even with --allow-errors
+    data = json.loads((tmp_path / "out.json").read_text())
+    for vid in _CHAT_VULNS:
+        v = data["variant"]["vulnerabilities"][vid]
+        assert (v["exploited"], v["not_exploited"], v["errors"]) == (0, 0, 2), vid
+    assert "identical response to every probe" in capsys.readouterr().err
+    assert "identical response" in (tmp_path / "out.md").read_text()
+
+
+def test_per_side_sentinels_from_each_agent_py(tmp_path):
+    var_msg = "variant REWROTE its failure reply"
+    v_py = _agent_py(tmp_path, "v.py", var_msg)
+    assert compare.default_error_sentinel(v_py) == var_msg
+
+    httpx = pytest.importorskip("httpx")
+    sec01_prompt = _REG.vulnerabilities[0].probes[0].prompt
+    assert _REG.vulnerabilities[0].id == "TA-SEC-01"
+
+    def handler(request):
+        if request.url.path == "/v1/chat/completions":
+            prompt = json.loads(request.content)["messages"][-1]["content"]
+            # The variant's runtime failure on the SEC-01 probe is ITS rewritten message.
+            content = var_msg if prompt == sec01_prompt else "fine" + _tag(prompt)
+            return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+        return httpx.Response(200, text="ok")
+
+    def factory(sentinel):
+        return lambda: compare.FailClosedHttpTransport(
+            "http://x.invalid", httpx_transport=httpx.MockTransport(handler),
+            error_sentinel=sentinel,
+        )
+
+    # Judged against the baseline's (different) sentinel, the variant's failure reply is
+    # graded as an answer; judged against its OWN sentinel (read from its agent.py) it errors.
+    wrong = asyncio.run(compare.run_side(_REG, factory("baseline failed text"), 1))
+    right = asyncio.run(compare.run_side(_REG, factory(compare.default_error_sentinel(v_py)), 1))
+    assert wrong["vulnerabilities"]["TA-SEC-01"]["errors"] == 0
+    assert wrong["vulnerabilities"]["TA-SEC-01"]["not_exploited"] == 1
+    assert right["vulnerabilities"]["TA-SEC-01"]["errors"] == 1
+    assert right["vulnerabilities"]["TA-SEC-01"]["not_exploited"] == 0
+    assert right["vulnerabilities"]["TA-REL-01"]["errors"] == 0
+
+
+def test_cli_records_both_sentinels_and_warns_on_fallback(tmp_path, monkeypatch, capsys):
+    seen = {}
+
+    def fake_make(url, model, sentinel=None):
+        seen[url] = sentinel
+        return lambda: (LeakyTransport() if url == "http://b.invalid" else SecureTransport())
+
+    monkeypatch.setattr(compare, "make_http_transport", fake_make)
+    b_py = _agent_py(tmp_path, "b.py", "baseline failure text")
+    rc = oracle_main.main(_cli_args(tmp_path) + ["--baseline-agent-py", b_py])
+    assert rc == 0
+    data = json.loads((tmp_path / "out.json").read_text())
+    assert data["error_sentinel"]["baseline"] == "baseline failure text"
+    assert data["error_sentinel"]["variant"] == compare.default_error_sentinel()
+    assert seen["http://b.invalid"] == "baseline failure text"
+    err = capsys.readouterr().err
+    assert "variant: neither --variant-agent-py nor --error-sentinel" in err
+    assert "baseline: neither" not in err
+
+    # --error-sentinel overrides both sides and silences the fallback warning
+    rc = oracle_main.main(_cli_args(tmp_path) + ["--error-sentinel", "explicit text"])
+    assert rc == 0
+    data = json.loads((tmp_path / "out.json").read_text())
+    assert data["error_sentinel"] == {"baseline": "explicit text", "variant": "explicit text"}
+    assert "neither" not in capsys.readouterr().err
+
+
+def test_cli_unreadable_agent_py_exits_2(tmp_path, capsys):
+    rc = oracle_main.main(
+        _cli_args(tmp_path) + ["--variant-agent-py", str(tmp_path / "missing.py")]
+    )
+    assert rc == 2
+    assert "ERROR_MESSAGE" in capsys.readouterr().err
+
+
+def test_blind_alnum_and_digit_overlap_validation():
+    first, second = _CANARY_TOKENS[0], _CANARY_TOKENS[1]
+    with pytest.raises(compare.CanaryMapError, match="alphanumeric"):
+        _validate({**_BLIND, first: "-------------"})
+    with pytest.raises(compare.CanaryMapError, match="alphanumeric"):
+        _validate({**_BLIND, first: "ab-cd-ef-g-____"})  # 7 alphanumerics
+    # digit-shaped values are compared by digit sequence for overlap
+    with pytest.raises(compare.CanaryMapError, match="substring of another"):
+        _validate({**_BLIND, first: "453298395580", second: "4532-9839-5580-6951"})
+    _validate({**_BLIND, first: "453298395580", second: "9111-2222-3333-4444"})
+
+
+def test_same_url_warning_recorded_and_printed(tmp_path, monkeypatch, capsys):
+    res = asyncio.run(
+        compare.run_compare(
+            _REGISTRY, LeakyTransport, SecureTransport, 1,
+            baseline_url="http://same.invalid", variant_url="http://same.invalid",
+        )
+    )
+    assert any("identical" in w and "URL" in w for w in res["warnings"])
+    different = asyncio.run(
+        compare.run_compare(
+            _REGISTRY, LeakyTransport, SecureTransport, 1,
+            baseline_url="http://a.invalid", variant_url="http://b.invalid",
+        )
+    )
+    assert different["warnings"] == []
+
+    monkeypatch.setattr(
+        compare, "make_http_transport",
+        lambda url, model, sentinel=None: (lambda: LeakyTransport()),
+    )
+    args = _cli_args(tmp_path)
+    args[args.index("--variant-url") + 1] = args[args.index("--baseline-url") + 1]
+    oracle_main.main(args)
+    assert "baseline and variant URLs are identical" in capsys.readouterr().err
+    data = json.loads((tmp_path / "out.json").read_text())
+    assert data["warnings"]
+
+
+def test_stateful_probes_recorded_and_documented(tmp_path):
+    res = _run(LeakyTransport(), SecureTransport(), trials=1)
+    assert res["stateful_probes_run"] == ["TA-REL-01-p1", "TA-REL-02-p1"]
+    assert res["baseline"]["stateful_probes_run"] == ["TA-REL-01-p1", "TA-REL-02-p1"]
+    md = compare.render_markdown(res)
+    assert "TA-REL-01-p1" in md and "TA-SEC-03-p1" in md and "fresh DB" in md
+
+    help_text = " ".join(
+        subprocess.run(
+            [sys.executable, "-m", "oracle", "compare", "--help"],
+            cwd=_ROOT, capture_output=True, text=True, timeout=60, check=False,
+        ).stdout.split()
+    )
+    assert "TA-REL-01" in help_text and "TA-REL-02" in help_text and "write to the DB" in help_text
+    for flag in ("--baseline-agent-py", "--variant-agent-py"):
+        assert flag in help_text
+    with open(os.path.join(_ROOT, "oracle", "README.md")) as fh:
+        readme = fh.read()
+    assert "TA-REL-01" in readme and "stateful_probes_run" in readme

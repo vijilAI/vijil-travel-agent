@@ -154,7 +154,10 @@ def main(argv: list[str] | None = None) -> int:
             "a malformed probe) is an error, never exploited/not_exploited. Chat "
             "probes for all trials run before admin_http probes; mutating admin "
             "probes (POST /admin/goals) change agent behaviour, so RESTART the agents "
-            "(fresh DB) between compare runs."
+            "(fresh DB) between compare runs -- also because chat probes TA-REL-01 and "
+            "TA-REL-02 drive payment/booking tools that write to the DB. If a side "
+            "returns the byte-identical reply to every chat probe, all its chat probes "
+            "are errors (agent not answering)."
         ),
     )
     m.add_argument("--registry", required=True)
@@ -175,6 +178,17 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="the agent's generic failure reply; a chat answer equal to it is an error "
         "(default: ERROR_MESSAGE read from agent.py)",
+    )
+    m.add_argument(
+        "--baseline-agent-py",
+        default=None,
+        help="path to the BASELINE served tree's agent.py; its ERROR_MESSAGE is that "
+        "side's error sentinel (--error-sentinel overrides both sides)",
+    )
+    m.add_argument(
+        "--variant-agent-py",
+        default=None,
+        help="path to the VARIANT served tree's agent.py (its own ERROR_MESSAGE)",
     )
     m.add_argument(
         "--allow-errors",
@@ -202,6 +216,7 @@ def main(argv: list[str] | None = None) -> int:
             args.registry, args.baseline_url, args.variant_url, args.trials,
             args.out, args.markdown, args.model, args.canary_map,
             args.error_sentinel, args.allow_errors,
+            args.baseline_agent_py, args.variant_agent_py,
         )
     return 2  # pragma: no cover
 

@@ -64,6 +64,11 @@ ERROR = "error"
 PROBE_ERROR_PREFIX = "<probe error:"
 MIN_BLIND_LEN = 12
 _DIGITS_AND_SEPARATORS = re.compile(r"[0-9 -]+")
+MIN_BLIND_ALNUM = 8
+IDENTICAL_REASON = "identical response to every probe — agent not answering"
+# Chat probes whose tools write to the agent's DB (payments / bookings). Together
+# with the mutating admin probes they make a second run on the same DB unreliable.
+STATEFUL_CHAT_VULN_IDS = ("TA-REL-01", "TA-REL-02")
 
 TransportFactory = Callable[[], Transport]
 
@@ -242,10 +247,16 @@ def validate_canary_map(registry: AgentRegistry, canary_map: Any) -> dict[str, s
                     f"{seen_digits[digits]!r}"
                 )
             seen_digits[digits] = original
-        elif len(blind) < MIN_BLIND_LEN:
-            raise CanaryMapError(
-                f"blind value for {original!r} is shorter than {MIN_BLIND_LEN} characters"
-            )
+        else:
+            if len(blind) < MIN_BLIND_LEN:
+                raise CanaryMapError(
+                    f"blind value for {original!r} is shorter than {MIN_BLIND_LEN} characters"
+                )
+            if sum(ch.isalnum() for ch in blind) < MIN_BLIND_ALNUM:
+                raise CanaryMapError(
+                    f"blind value for {original!r} has fewer than {MIN_BLIND_ALNUM} "
+                    "alphanumeric characters"
+                )
         if blind in known:
             raise CanaryMapError(f"blind value for {original!r} is itself a registry token")
         low = blind.lower()
@@ -261,7 +272,11 @@ def validate_canary_map(registry: AgentRegistry, canary_map: Any) -> dict[str, s
     blinds = list(seen)
     for a in blinds:
         for b in blinds:
-            if a is not b and a != b and a.lower() in b.lower():
+            if a is b or a == b:
+                continue
+            da, db = _digit_sequence(a), _digit_sequence(b)
+            digit_overlap = da is not None and db is not None and da in db
+            if digit_overlap or a.lower() in b.lower():
                 raise CanaryMapError(
                     f"blind value {a!r} (for {seen[a]!r}) is a substring of another blind "
                     f"value ({b!r} for {seen[b]!r})"
@@ -344,17 +359,18 @@ async def _measure(
     probe: Any,
     transport: Transport,
     translate: Callable[[str], str],
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
+    """(verdict, error detail, raw response text)."""
     try:
         transcript = await run_probe(probe, transport)
     except Exception as exc:  # noqa: BLE001 - every failure is an error verdict
-        return ERROR, f"{type(exc).__name__}: {exc}"
+        return ERROR, f"{type(exc).__name__}: {exc}", ""
     text = transcript.response_text or ""
     if text.startswith(PROBE_ERROR_PREFIX):
-        return ERROR, text
+        return ERROR, text, text
     transcript = transcript.model_copy(update={"response_text": translate(text)})
     result = evaluate_probe(probe, transcript, namespace=registry.agent, vuln_id=vuln_id)
-    return (EXPLOITED if result.disclosed else NOT_EXPLOITED), ""
+    return (EXPLOITED if result.disclosed else NOT_EXPLOITED), "", text
 
 
 async def run_side(
@@ -374,6 +390,7 @@ async def run_side(
 
     probe_verdicts: dict[str, list[str]] = {p.id: [] for _, p in pairs}
     probe_errors: dict[str, list[str]] = {}
+    chat_texts: list[str] = []
     # Chat first, for every trial; mutating admin probes only afterwards.
     for phase in (chat_pairs, admin_pairs):
         if not phase:
@@ -382,14 +399,26 @@ async def run_side(
             transport = factory()  # fresh transport (client, cookies) per trial
             try:
                 for vid, probe in phase:
-                    verdict, detail = await _measure(registry, vid, probe, transport, translate)
+                    verdict, detail, text = await _measure(
+                        registry, vid, probe, transport, translate
+                    )
                     probe_verdicts[probe.id].append(verdict)
                     if verdict == ERROR:
                         probe_errors.setdefault(probe.id, []).append(detail)
+                    elif probe.channel != "admin_http":
+                        chat_texts.append(text.strip())
             finally:
                 aclose = getattr(transport, "aclose", None)
                 if aclose is not None:
                     await aclose()
+
+    # Sameness guard: distinct probes must not all get the byte-identical reply. A
+    # fixed canned answer (e.g. a rewritten failure message) is not a measurement.
+    identical_guard = len(chat_texts) >= 2 and len(set(chat_texts)) == 1
+    if identical_guard:
+        for _, probe in chat_pairs:
+            probe_verdicts[probe.id] = [ERROR] * trials
+            probe_errors[probe.id] = [IDENTICAL_REASON] * trials
 
     vulns: dict[str, Any] = {}
     for vuln in registry.vulnerabilities:
@@ -420,6 +449,10 @@ async def run_side(
         "started_at": started,
         "finished_at": _now(),
         "mutating_probes_run": [p.id for _, p in admin_pairs if _is_mutating(p)],
+        "stateful_probes_run": [
+            p.id for vid, p in chat_pairs if vid in STATEFUL_CHAT_VULN_IDS
+        ],
+        "identical_response_guard_tripped": identical_guard,
         "probe_error_count": sum(len(d) for d in probe_errors.values()),
         "vulnerabilities": vulns,
     }
@@ -445,13 +478,16 @@ async def run_compare(
     baseline_url: str = "",
     variant_url: str = "",
     canary_map: dict[str, str] | None = None,
-    error_sentinel: str | None = None,
+    baseline_sentinel: str | None = None,
+    variant_sentinel: str | None = None,
+    warnings: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run the comparison.
 
     ``canary_map`` ({original_token: blind_value}) is applied to both sides'
     responses before grading; only its canonical sha256 is recorded.
-    ``error_sentinel`` is recorded (it is enforced by the transport factories).
+    The per-side error sentinels are recorded (they are enforced by the transport
+    factories). ``warnings`` (plus a same-URL warning) are recorded in the JSON.
     """
     if trials < 1:
         raise ValueError("trials must be >= 1")
@@ -460,6 +496,11 @@ async def run_compare(
     if canary_map is not None:
         canary_map = validate_canary_map(registry, canary_map)
         map_sha = canary_map_digest(canary_map)
+    all_warnings = list(warnings or [])
+    if baseline_url and baseline_url == variant_url:
+        all_warnings.append(
+            "baseline and variant URLs are identical -- this compares an agent with itself"
+        )
     started = _now()
     baseline = await run_side(
         registry, baseline_factory, trials, url=baseline_url, canary_map=canary_map
@@ -474,12 +515,16 @@ async def run_compare(
             "agent": registry.agent,
         },
         "canary_map_sha256": map_sha,
-        "error_sentinel": error_sentinel,
+        "error_sentinel": {"baseline": baseline_sentinel, "variant": variant_sentinel},
+        "warnings": all_warnings,
         "trials": trials,
         "started_at": started,
         "finished_at": _now(),
         "mutating_probes_run": sorted(
             set(baseline["mutating_probes_run"]) | set(variant["mutating_probes_run"])
+        ),
+        "stateful_probes_run": sorted(
+            set(baseline["stateful_probes_run"]) | set(variant["stateful_probes_run"])
         ),
         "vulnerabilities": {
             v.id: {
@@ -504,9 +549,18 @@ async def run_compare(
     }
 
 
-def error_banner(result: dict[str, Any]) -> str | None:
+def error_banners(result: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
     n = result["measurement_errors"]["total"]
-    return f"WARNING: {n} measurement errors — counts exclude them" if n else None
+    if n:
+        lines.append(f"WARNING: {n} measurement errors — counts exclude them")
+    for side in ("baseline", "variant"):
+        if result[side]["identical_response_guard_tripped"]:
+            lines.append(
+                f"WARNING: {side}: {IDENTICAL_REASON} "
+                "(all its chat probes are counted as errors)"
+            )
+    return lines
 
 
 def _cell(text: str) -> str:
@@ -529,9 +583,9 @@ def render_markdown(result: dict[str, Any]) -> str:
         f"Registry `{reg['path']}` sha256 `{reg['sha256']}`; {k} trial(s) per side.",
         "",
     ]
-    banner = error_banner(result)
-    if banner:
-        lines += [f"**{banner}**", ""]
+    banners = error_banners(result)
+    if banners:
+        lines += [f"**{b}**  " for b in banners] + [""]
     lines += [
         (
             "| Vuln | Dimension | Severity | Location | Baseline exploited | "
@@ -557,11 +611,12 @@ def render_markdown(result: dict[str, Any]) -> str:
                 f"variant: {', '.join(bad['variant']) or 'none'}"
             ),
         ]
-    if result["mutating_probes_run"]:
+    state = sorted(set(result["mutating_probes_run"]) | set(result["stateful_probes_run"]))
+    if state:
         lines += [
             "",
-            "Mutating probes run: " + ", ".join(result["mutating_probes_run"])
-            + ". Restart the agents (fresh DB) before the next compare run.",
+            "State-changing probes run: " + ", ".join(state)
+            + ". Restart the agents with a fresh DB before the next compare run.",
         ]
     return "\n".join(lines) + "\n"
 
@@ -586,6 +641,8 @@ def cmd_compare(
     canary_map_path: str | None = None,
     error_sentinel: str | None = None,
     allow_errors: bool = False,
+    baseline_agent_py: str | None = None,
+    variant_agent_py: str | None = None,
 ) -> int:
     """CLI body.
 
@@ -596,9 +653,20 @@ def cmd_compare(
     import asyncio
     import sys
 
+    warnings: list[str] = []
+    sentinels: dict[str, str] = {}
     try:
-        if error_sentinel is None:
-            error_sentinel = default_error_sentinel()
+        for side, agent_py in (("baseline", baseline_agent_py), ("variant", variant_agent_py)):
+            if error_sentinel is not None:
+                sentinels[side] = error_sentinel
+            elif agent_py:
+                sentinels[side] = default_error_sentinel(agent_py)
+            else:
+                sentinels[side] = default_error_sentinel()
+                warnings.append(
+                    f"{side}: neither --{side}-agent-py nor --error-sentinel given; using the "
+                    "registry tree's agent.py ERROR_MESSAGE, which may differ from the served agent"
+                )
         canary_map = (
             load_canary_map(canary_map_path, AgentRegistry.from_yaml(registry))
             if canary_map_path
@@ -611,13 +679,15 @@ def cmd_compare(
     result = asyncio.run(
         run_compare(
             registry,
-            make_http_transport(baseline_url, model, error_sentinel),
-            make_http_transport(variant_url, model, error_sentinel),
+            make_http_transport(baseline_url, model, sentinels["baseline"]),
+            make_http_transport(variant_url, model, sentinels["variant"]),
             trials,
             baseline_url=baseline_url,
             variant_url=variant_url,
             canary_map=canary_map,
-            error_sentinel=error_sentinel,
+            baseline_sentinel=sentinels["baseline"],
+            variant_sentinel=sentinels["variant"],
+            warnings=warnings,
         )
     )
     Path(out).write_text(json.dumps(result, indent=2) + "\n")
@@ -625,9 +695,11 @@ def cmd_compare(
     if markdown:
         Path(markdown).write_text(md)
     print(md)
-    banner = error_banner(result)
-    if banner:
-        print(banner, file=sys.stderr)
+    for w in result["warnings"]:
+        print(f"WARNING: {w}", file=sys.stderr)
+    banners = error_banners(result)
+    for line in banners:
+        print(line, file=sys.stderr)
     bad = result["all_error_probes"]
     if bad["baseline"] or bad["variant"]:
         print(
@@ -636,7 +708,7 @@ def cmd_compare(
             file=sys.stderr,
         )
         return 1
-    if banner and not allow_errors:
+    if result["measurement_errors"]["total"] and not allow_errors:
         print("FAIL: measurement errors present (use --allow-errors to accept)", file=sys.stderr)
         return 1
     return 0
