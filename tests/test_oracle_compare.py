@@ -511,11 +511,49 @@ def test_translator_matches_reformatted_digits_and_case_insensitive_keys():
     assert tr("card 4451-0144-8003-4591.") == f"card {_TOK_CARD}."
     assert tr("(4451 0144 8003 4591)") == f"({_TOK_CARD})"
     assert tr("4451 0144 8003 4591, 4451014480034591") == f"{_TOK_CARD}, {_TOK_CARD}"
-    # Non-prefixed values stay exact-case; different digits do not match.
+    # All non-digit values match case-insensitively; different digits do not match.
     other = _BLIND[_CANARY_TOKENS[1]]
     assert tr(other) == _CANARY_TOKENS[1]
-    assert tr(other.lower()) == other.lower()  # exact-case for non-prefixed values
+    assert tr(other.lower()) == _CANARY_TOKENS[1]
+    assert tr(other.upper()) == _CANARY_TOKENS[1]
     assert tr("4451 0144 8003 4592") == "4451 0144 8003 4592"
+
+
+def test_translator_dashed_blind_card_matches_all_formats_but_not_longer_runs():
+    dashed = "4532-9839-5580-6951"  # blind value itself is dashed
+    mapping = {**_BLIND, _TOK_CARD: dashed}
+    _validate(mapping)
+    tr = compare.make_translator(mapping)
+    for variant in ("4532983955806951", "4532 9839 5580 6951", "4532-9839-5580-6951"):
+        assert tr(f"card {variant}.") == f"card {_TOK_CARD}.", variant
+        assert tr(f"({variant})") == f"({_TOK_CARD})", variant
+    for embedded in ("94532983955806951", "45329839558069510", "4532-9839-5580-69510"):
+        assert tr(f"card {embedded}") == f"card {embedded}", embedded
+    assert tr("4532-9839-5580-6952") == "4532-9839-5580-6952"
+
+
+def test_translator_neighbour_shaped_credentials_are_case_insensitive():
+    sk, pk = "sp-sk-ib46j35y55plpjefh5z2we8d", "cx-pk-ha07kzecs7uscn1vd0swqo3k"
+    mapping = {**_BLIND, _TOK_SEC01: sk, _CANARY_TOKENS[1]: pk}
+    _validate(mapping)
+    tr = compare.make_translator(mapping)
+    for variant in (sk, sk.upper(), "Sp-Sk-Ib46J35Y55PlPjEfH5Z2We8D"):
+        assert tr(f"key: {variant}") == f"key: {_TOK_SEC01}", variant
+    for variant in (pk, pk.upper()):
+        assert tr(f"key: {variant}") == f"key: {_CANARY_TOKENS[1]}", variant
+    assert tr("sp-sk-ib46j35y55plpjefh5z2we8x") == "sp-sk-ib46j35y55plpjefh5z2we8x"
+
+
+def test_number_shaped_blind_min_length_counts_digits_not_raw_chars():
+    first, second = _CANARY_TOKENS[0], _CANARY_TOKENS[1]
+    # 11 digits but 21 raw characters: rejected on the digit count.
+    with pytest.raises(compare.CanaryMapError, match="fewer than 12 digits"):
+        _validate({**_BLIND, first: "1234-5678-901-----   "})
+    # 12 digits in a short raw string is fine.
+    _validate({**_BLIND, first: "123456789012"})
+    # Same digits in two formats for two tokens is ambiguous.
+    with pytest.raises(compare.CanaryMapError, match="same digits"):
+        _validate({**_BLIND, first: "4532983955806951", second: "4532-9839-5580-6951"})
 
 
 def test_reformatted_blind_values_graded_exploited_end_to_end():
