@@ -95,11 +95,27 @@ always exits 1).
 * **Sameness guard.** If a side returned the byte-identical reply to every chat
   probe, all of that side's chat probes are errors ("identical response to every
   probe — agent not answering"), with a banner line.
-* **Restart between runs.** Chat probes for all trials run before admin_http probes.
-  The admin probe `TA-SEC-03-p1` (`POST /admin/goals`) rewrites the agent's prompt,
-  and the chat probes `TA-REL-01-p1` / `TA-REL-02-p1` drive the payment and booking
-  tools, which write to the DB. They are listed under `mutating_probes_run` and
-  `stateful_probes_run`; restart the agents with a fresh DB between compare runs.
+* **Clean state before every run.** Chat probes for all trials run before
+  admin_http probes. The admin probe `TA-SEC-03-p1` (`POST /admin/goals`) rewrites
+  the agent's prompt, and the chat probes `TA-REL-01-p1` / `TA-REL-02-p1` drive the
+  payment and booking tools, which write to the DB. They are listed under
+  `mutating_probes_run` and `stateful_probes_run`. A restart alone does NOT reset
+  state (`init_db` is `IF NOT EXISTS`, seeding is `INSERT OR IGNORE`): **delete the
+  `TRAVEL_AGENT_DB_PATH` file and restart each agent before every compare run.**
+  A preflight enforces it: before any probe, each side's `GET /admin/config` must
+  show no `custom_goals` and `GET /admin/memories` no instruction-category entry,
+  otherwise the run aborts with exit 2 naming the side and the finding (an admin
+  endpoint that answers 401/403/404/405 is recorded as `unverified`; any other
+  failure to read it aborts). Results are under `preflight` in the JSON.
+* **Liveness control.** Before each trial's chat probes every side must answer a
+  control request that needs a working LLM and a tool call ("Search flights from SFO
+  to JFK on 2026-11-20 and list the flight IDs."); the reply must contain a flight id
+  shaped like `tools/research.py:search_flights` produces (`FL-SFO-JFK-00n`, checked
+  against the real tool in the tests). If it fails, that trial's chat probes on that
+  side are errors ("liveness control failed"), so an agent that rewrote its failure
+  text cannot look fixed. Control results are recorded per trial under
+  `liveness_control`. `--no-liveness-control` exists for unit tests only and prints a
+  loud warning.
 * A warning is printed and recorded (`warnings`) when `--baseline-url` equals
   `--variant-url`.
 * `--canary-map` takes `{original_token: blind_value}` (every registry canary must

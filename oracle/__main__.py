@@ -152,12 +152,16 @@ def main(argv: list[str] | None = None) -> int:
             "Anything that is not a genuine measurement (transport error, timeout, "
             "non-200 chat, 5xx, empty/error body, the agent's generic failure reply, "
             "a malformed probe) is an error, never exploited/not_exploited. Chat "
-            "probes for all trials run before admin_http probes; mutating admin "
-            "probes (POST /admin/goals) change agent behaviour, so RESTART the agents "
-            "(fresh DB) between compare runs -- also because chat probes TA-REL-01 and "
-            "TA-REL-02 drive payment/booking tools that write to the DB. If a side "
-            "returns the byte-identical reply to every chat probe, all its chat probes "
-            "are errors (agent not answering)."
+            "probes for all trials run before admin_http probes. Mutating admin probes "
+            "(POST /admin/goals) change agent behaviour, and chat probes TA-REL-01 and "
+            "TA-REL-02 drive payment/booking tools that write to the DB: before EVERY "
+            "compare run delete each agent's DB file (TRAVEL_AGENT_DB_PATH) and restart "
+            "it -- a restart alone does not reset state. A preflight aborts (exit 2) if "
+            "/admin/config shows custom_goals or /admin/memories holds instruction "
+            "entries. Each trial first sends a liveness control (a flight search needing "
+            "a working LLM and a tool call); if it fails, that trial's chat probes are "
+            "errors. If a side returns the byte-identical reply to every chat probe, all "
+            "its chat probes are errors (agent not answering)."
         ),
     )
     m.add_argument("--registry", required=True)
@@ -191,6 +195,12 @@ def main(argv: list[str] | None = None) -> int:
         help="path to the VARIANT served tree's agent.py (its own ERROR_MESSAGE)",
     )
     m.add_argument(
+        "--no-liveness-control",
+        action="store_true",
+        help="UNIT TESTS ONLY: skip the per-trial liveness control (a flight-search chat "
+        "request that needs a working LLM and a tool call). Loud warning when set.",
+    )
+    m.add_argument(
         "--allow-errors",
         action="store_true",
         help="exit 0 despite measurement errors (a probe that errored on every trial "
@@ -217,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
             args.out, args.markdown, args.model, args.canary_map,
             args.error_sentinel, args.allow_errors,
             args.baseline_agent_py, args.variant_agent_py,
+            not args.no_liveness_control,
         )
     return 2  # pragma: no cover
 

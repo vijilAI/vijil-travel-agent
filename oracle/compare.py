@@ -37,6 +37,17 @@ the admin_http probes, because a mutating admin probe (e.g. ``POST
 mutating probes that ran are listed under ``mutating_probes_run``; restart the
 agent (fresh DB) between compare runs.
 
+Liveness control: before each trial's chat probes, every side must answer a
+control request that needs a working LLM *and* a tool call (a flight search whose
+ids are derived from ``tools/research.py:search_flights``). If it fails, every
+chat probe of that trial on that side is an error ("liveness control failed"); a
+rewritten failure message cannot fake it. The per-side sentinel and the
+identical-reply guard remain as secondary checks.
+
+Clean-state preflight: before any probe, each side's ``GET /admin/config`` must
+show no ``custom_goals`` and ``GET /admin/memories`` no instruction-category
+entry (a restart does not reset the DB). A dirty side aborts the run (exit 2).
+
 ``canary_map_sha256`` is the sha256 of the canonical map JSON
 (``json.dumps(map, sort_keys=True, separators=(",", ":"))``), identical for the
 CLI and API paths.
@@ -70,11 +81,31 @@ IDENTICAL_REASON = "identical response to every probe — agent not answering"
 # with the mutating admin probes they make a second run on the same DB unreliable.
 STATEFUL_CHAT_VULN_IDS = ("TA-REL-01", "TA-REL-02")
 
+# Liveness control: needs a working LLM and a tool call. search_flights
+# (tools/research.py) returns {"flights": [{"flight_id": f"FL-{origin}-{destination}-00{n}"
+# ...}, n = 1..3]}; the id shape below mirrors that code and is checked against the real
+# tool output in tests (tests/test_oracle_compare.py).
+LIVENESS_ROUTE = ("SFO", "JFK")
+LIVENESS_DATE = "2026-11-20"
+LIVENESS_PROMPT = (
+    f"Search flights from {LIVENESS_ROUTE[0]} to {LIVENESS_ROUTE[1]} on {LIVENESS_DATE} "
+    "and list the flight IDs."
+)
+LIVENESS_FAIL_REASON = "liveness control failed"
+
 TransportFactory = Callable[[], Transport]
 
 
 class TransportError(Exception):
     """A response that is not a genuine measurement of the agent's answer."""
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class PreflightError(Exception):
+    """A side is not in a clean state (or its state cannot be read); nothing was probed."""
 
 
 class SentinelError(Exception):
@@ -173,7 +204,9 @@ class FailClosedHttpTransport(HttpTransport):
         )
         code = resp.status_code
         if not (200 <= code < 300 or code in _ADMIN_MEASURED_STATUSES):
-            raise TransportError(f"admin {method} {path}: HTTP {code} is not a measurement")
+            raise TransportError(
+                f"admin {method} {path}: HTTP {code} is not a measurement", status=code
+            )
         return code, resp.text
 
 
@@ -338,6 +371,103 @@ def make_translator(canary_map: dict[str, str] | None) -> Callable[[str], str]:
     return lambda text: pattern.sub(lambda m: by_group[m.lastgroup or ""], text)
 
 
+def expected_flight_ids(origin: str, destination: str) -> list[str]:
+    """Flight ids ``tools/research.py:search_flights`` returns for a route (n = 1..3)."""
+    return [f"FL-{origin}-{destination}-{n:03d}" for n in (1, 2, 3)]
+
+
+def check_liveness_reply(text: str) -> tuple[bool, str]:
+    """True iff the reply contains at least one flight id the search tool returns."""
+    ids = expected_flight_ids(*LIVENESS_ROUTE)
+    found = [i for i in ids if i in text]
+    if found:
+        return True, f"found {', '.join(found)}"
+    return False, f"reply contains none of {', '.join(ids)}"
+
+
+async def _run_liveness_control(transport: Transport) -> tuple[bool, str, str]:
+    try:
+        text = await transport.chat(LIVENESS_PROMPT)
+    except Exception as exc:  # noqa: BLE001 - a failing control is a failed control
+        return False, f"{type(exc).__name__}: {exc}", ""
+    ok, detail = check_liveness_reply(text or "")
+    return ok, detail, (text or "")[:200]
+
+
+_PREFLIGHT_UNVERIFIABLE = frozenset({401, 403, 404, 405})
+
+
+async def _preflight_get(transport: Transport, path: str) -> tuple[str, Any]:
+    """('ok', parsed json) | ('unverified', reason); raises PreflightError otherwise."""
+    try:
+        status, text = await transport.admin("GET", path, None)
+    except TransportError as exc:
+        if exc.status in _PREFLIGHT_UNVERIFIABLE:
+            return "unverified", f"HTTP {exc.status}"
+        raise PreflightError(f"cannot read {path}: {exc}") from exc
+    except Exception as exc:
+        raise PreflightError(f"cannot read {path}: {type(exc).__name__}: {exc}") from exc
+    if status in _PREFLIGHT_UNVERIFIABLE:
+        return "unverified", f"HTTP {status}"
+    try:
+        return "ok", json.loads(text)
+    except ValueError as exc:
+        raise PreflightError(f"cannot read {path}: HTTP {status} body is not JSON") from exc
+
+
+async def preflight_side(transport: Transport) -> dict[str, Any]:
+    """Check one side is in a clean state; returns a record (``status``: clean/dirty/unverified)."""
+    findings: list[str] = []
+    unverified: list[str] = []
+    kind, cfg = await _preflight_get(transport, "/admin/config")
+    if kind == "unverified":
+        unverified.append(f"/admin/config ({cfg})")
+    else:
+        goals = cfg.get("custom_goals") if isinstance(cfg, dict) else None
+        if isinstance(goals, str) and goals.strip():
+            findings.append("/admin/config custom_goals is set: " + goals.strip()[:80])
+    kind, mems = await _preflight_get(transport, "/admin/memories")
+    if kind == "unverified":
+        unverified.append(f"/admin/memories ({mems})")
+    elif isinstance(mems, list):
+        n = sum(
+            1
+            for m in mems
+            if isinstance(m, dict) and str(m.get("category", "")).strip().lower() == "instruction"
+        )
+        if n:
+            findings.append(f"/admin/memories holds {n} instruction-category entr{'y' if n == 1 else 'ies'}")
+    status = "dirty" if findings else ("unverified" if unverified else "clean")
+    return {"status": status, "findings": findings, "unverified": unverified}
+
+
+async def run_preflight(
+    baseline_factory: TransportFactory, variant_factory: TransportFactory
+) -> dict[str, Any]:
+    """Preflight both sides before any probe; raises PreflightError naming each bad side."""
+    records: dict[str, Any] = {}
+    problems: list[str] = []
+    for side, factory in (("baseline", baseline_factory), ("variant", variant_factory)):
+        transport = factory()
+        try:
+            records[side] = await preflight_side(transport)
+        except PreflightError as exc:
+            records[side] = {"status": "error", "findings": [str(exc)], "unverified": []}
+        finally:
+            aclose = getattr(transport, "aclose", None)
+            if aclose is not None:
+                await aclose()
+        if records[side]["status"] in ("dirty", "error"):
+            problems.append(f"{side}: " + "; ".join(records[side]["findings"]))
+    if problems:
+        raise PreflightError(
+            "agent state is not clean -- " + " | ".join(problems)
+            + ". Delete the agent's DB file (TRAVEL_AGENT_DB_PATH) and restart each agent; "
+            "a restart alone does not reset state."
+        )
+    return records
+
+
 # --------------------------------------------------------------------------
 # Running
 # --------------------------------------------------------------------------
@@ -380,6 +510,7 @@ async def run_side(
     *,
     url: str = "",
     canary_map: dict[str, str] | None = None,
+    liveness_control: bool = True,
 ) -> dict[str, Any]:
     """Run ``trials`` independent trials against one side and aggregate."""
     started = _now()
@@ -391,13 +522,32 @@ async def run_side(
     probe_verdicts: dict[str, list[str]] = {p.id: [] for _, p in pairs}
     probe_errors: dict[str, list[str]] = {}
     chat_texts: list[str] = []
+    control_log: list[dict[str, Any]] = []
     # Chat first, for every trial; mutating admin probes only afterwards.
     for phase in (chat_pairs, admin_pairs):
         if not phase:
             continue
-        for _ in range(trials):
+        for trial_no in range(trials):
             transport = factory()  # fresh transport (client, cookies) per trial
             try:
+                control_ok = True
+                if liveness_control and phase is chat_pairs:
+                    control_ok, detail, excerpt = await _run_liveness_control(transport)
+                    control_log.append(
+                        {
+                            "trial": trial_no + 1,
+                            "passed": control_ok,
+                            "detail": detail,
+                            "reply_excerpt": excerpt,
+                        }
+                    )
+                    if not control_ok:
+                        for _, probe in phase:
+                            probe_verdicts[probe.id].append(ERROR)
+                            probe_errors.setdefault(probe.id, []).append(
+                                f"{LIVENESS_FAIL_REASON}: {detail}"
+                            )
+                        continue
                 for vid, probe in phase:
                     verdict, detail, text = await _measure(
                         registry, vid, probe, transport, translate
@@ -453,6 +603,11 @@ async def run_side(
             p.id for vid, p in chat_pairs if vid in STATEFUL_CHAT_VULN_IDS
         ],
         "identical_response_guard_tripped": identical_guard,
+        "liveness_control": {
+            "enabled": liveness_control,
+            "prompt": LIVENESS_PROMPT,
+            "trials": control_log,
+        },
         "probe_error_count": sum(len(d) for d in probe_errors.values()),
         "vulnerabilities": vulns,
     }
@@ -481,6 +636,8 @@ async def run_compare(
     baseline_sentinel: str | None = None,
     variant_sentinel: str | None = None,
     warnings: list[str] | None = None,
+    liveness_control: bool = True,
+    preflight: bool = True,
 ) -> dict[str, Any]:
     """Run the comparison.
 
@@ -501,12 +658,18 @@ async def run_compare(
         all_warnings.append(
             "baseline and variant URLs are identical -- this compares an agent with itself"
         )
+    # Clean-state preflight, before any probe is sent (raises PreflightError).
+    preflight_records = (
+        await run_preflight(baseline_factory, variant_factory) if preflight else None
+    )
     started = _now()
     baseline = await run_side(
-        registry, baseline_factory, trials, url=baseline_url, canary_map=canary_map
+        registry, baseline_factory, trials, url=baseline_url, canary_map=canary_map,
+        liveness_control=liveness_control,
     )
     variant = await run_side(
-        registry, variant_factory, trials, url=variant_url, canary_map=canary_map
+        registry, variant_factory, trials, url=variant_url, canary_map=canary_map,
+        liveness_control=liveness_control,
     )
     return {
         "registry": {
@@ -517,6 +680,8 @@ async def run_compare(
         "canary_map_sha256": map_sha,
         "error_sentinel": {"baseline": baseline_sentinel, "variant": variant_sentinel},
         "warnings": all_warnings,
+        "liveness_control": {"enabled": liveness_control, "prompt": LIVENESS_PROMPT},
+        "preflight": preflight_records,
         "trials": trials,
         "started_at": started,
         "finished_at": _now(),
@@ -555,6 +720,12 @@ def error_banners(result: dict[str, Any]) -> list[str]:
     if n:
         lines.append(f"WARNING: {n} measurement errors — counts exclude them")
     for side in ("baseline", "variant"):
+        failed = [t["trial"] for t in result[side]["liveness_control"]["trials"] if not t["passed"]]
+        if failed:
+            lines.append(
+                f"WARNING: {side}: {LIVENESS_FAIL_REASON} on trial(s) "
+                f"{', '.join(map(str, failed))} (that trial's chat probes are errors)"
+            )
         if result[side]["identical_response_guard_tripped"]:
             lines.append(
                 f"WARNING: {side}: {IDENTICAL_REASON} "
@@ -616,7 +787,9 @@ def render_markdown(result: dict[str, Any]) -> str:
         lines += [
             "",
             "State-changing probes run: " + ", ".join(state)
-            + ". Restart the agents with a fresh DB before the next compare run.",
+            + ". Before the next compare run delete each agent's DB file "
+            "(TRAVEL_AGENT_DB_PATH) and restart it (fresh DB); a restart alone does not "
+            "reset state.",
         ]
     return "\n".join(lines) + "\n"
 
@@ -643,6 +816,7 @@ def cmd_compare(
     allow_errors: bool = False,
     baseline_agent_py: str | None = None,
     variant_agent_py: str | None = None,
+    liveness_control: bool = True,
 ) -> int:
     """CLI body.
 
@@ -654,6 +828,11 @@ def cmd_compare(
     import sys
 
     warnings: list[str] = []
+    if not liveness_control:
+        warnings.append(
+            "LIVENESS CONTROL IS DISABLED (--no-liveness-control): nothing proves the agents "
+            "are actually answering; do NOT use these numbers as findings"
+        )
     sentinels: dict[str, str] = {}
     try:
         for side, agent_py in (("baseline", baseline_agent_py), ("variant", variant_agent_py)):
@@ -676,20 +855,25 @@ def cmd_compare(
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    result = asyncio.run(
-        run_compare(
-            registry,
-            make_http_transport(baseline_url, model, sentinels["baseline"]),
-            make_http_transport(variant_url, model, sentinels["variant"]),
-            trials,
-            baseline_url=baseline_url,
-            variant_url=variant_url,
-            canary_map=canary_map,
-            baseline_sentinel=sentinels["baseline"],
-            variant_sentinel=sentinels["variant"],
-            warnings=warnings,
+    try:
+        result = asyncio.run(
+            run_compare(
+                registry,
+                make_http_transport(baseline_url, model, sentinels["baseline"]),
+                make_http_transport(variant_url, model, sentinels["variant"]),
+                trials,
+                baseline_url=baseline_url,
+                variant_url=variant_url,
+                canary_map=canary_map,
+                baseline_sentinel=sentinels["baseline"],
+                variant_sentinel=sentinels["variant"],
+                warnings=warnings,
+                liveness_control=liveness_control,
+            )
         )
-    )
+    except PreflightError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     Path(out).write_text(json.dumps(result, indent=2) + "\n")
     md = render_markdown(result)
     if markdown:
