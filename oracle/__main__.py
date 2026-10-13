@@ -16,7 +16,7 @@ Usage:
   # A/B-compare a baseline and a variant agent over K independent trials:
   python -m oracle compare --registry vulnerabilities.yaml \
       --baseline-url URL --variant-url URL --trials K --out cmp.json \
-      [--markdown cmp.md]
+      [--markdown cmp.md] [--canary-map blind_map.json]
 
 Exit code is non-zero when validation finds issues, so this is CI-usable.
 """
@@ -154,6 +154,12 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("--out", required=True, help="path to write the comparison JSON")
     m.add_argument("--markdown", default=None, help="optional path to write a Markdown table")
     m.add_argument("--model", default="probe")
+    m.add_argument(
+        "--canary-map",
+        default=None,
+        help="JSON {original_token: blind_value}; blind values in responses are "
+        "translated back to the original tokens before grading (both sides)",
+    )
     args = parser.parse_args(argv)
     if args.cmd == "validate":
         return _cmd_validate(args.patterns)
@@ -170,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
 
         return cmd_compare(
             args.registry, args.baseline_url, args.variant_url, args.trials,
-            args.out, args.markdown, args.model,
+            args.out, args.markdown, args.model, args.canary_map,
         )
     return 2  # pragma: no cover
 

@@ -210,3 +210,114 @@ def test_help_via_subprocess():
     assert proc.returncode == 0
     for flag in ("--registry", "--baseline-url", "--variant-url", "--trials", "--out", "--markdown"):
         assert flag in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# --canary-map (blind deployment): blind values are translated back before grading
+# ---------------------------------------------------------------------------
+
+_CANARY_TOKENS = [
+    token(_REG.agent, v.id, c.slot) for v in _REG.vulnerabilities for c in v.canaries
+]
+_BLIND = {tok: f"BLIND-{i:04d}-opaque" for i, tok in enumerate(_CANARY_TOKENS)}
+_CANARY_VULNS = ["TA-SEC-01", "TA-SEC-02", "TA-SAF-01", "TA-SAF-02"]
+
+
+class BlindLeakyTransport(LeakyTransport):
+    """Leaks the blind (opaque) canary values, never the registry tokens."""
+
+    async def chat(self, prompt, system_prompt=None):
+        return "Sure! " + " ".join(_BLIND.values())
+
+    async def admin(self, method, path, body):
+        return 200, " ".join(_BLIND.values())
+
+
+def _run_map(baseline, variant, canary_map, trials=2):
+    return asyncio.run(
+        compare.run_compare(
+            _REGISTRY, lambda: baseline, lambda: variant, trials, canary_map=canary_map
+        )
+    )
+
+
+def test_canary_map_blind_value_counts_as_exploited_only_with_map():
+    # Sanity: the blind leaker never emits a registry token.
+    assert not any(tok in " ".join(_BLIND.values()) for tok in _CANARY_TOKENS)
+
+    mapped = _run_map(BlindLeakyTransport(), SecureTransport(), _BLIND)
+    for vid in _CANARY_VULNS:
+        b = mapped["baseline"]["vulnerabilities"][vid]
+        v = mapped["variant"]["vulnerabilities"][vid]
+        assert (b["exploited"], b["not_exploited"], b["errors"]) == (2, 0, 0), vid
+        assert (v["exploited"], v["not_exploited"], v["errors"]) == (0, 2, 0), vid
+
+    # Same responses, no map: the blind value alone is NOT counted.
+    unmapped = _run_map(BlindLeakyTransport(), SecureTransport(), None)
+    for vid in _CANARY_VULNS:
+        b = unmapped["baseline"]["vulnerabilities"][vid]
+        assert (b["exploited"], b["not_exploited"], b["errors"]) == (0, 2, 0), vid
+
+
+def test_canary_map_translation_is_not_substring_of_other_text():
+    # A response WITHOUT the blind value stays not-exploited even with the map on.
+    res = _run_map(SecureTransport(), SecureTransport(), _BLIND)
+    for vid in _CANARY_VULNS:
+        assert res["baseline"]["vulnerabilities"][vid]["exploited"] == 0, vid
+
+
+def test_canary_map_digest_recorded_not_contents(tmp_path, monkeypatch):
+    transports = {"http://b.invalid": BlindLeakyTransport(), "http://v.invalid": SecureTransport()}
+    monkeypatch.setattr(
+        compare, "make_http_transport", lambda url, model: (lambda: transports[url])
+    )
+    mp = tmp_path / "map.json"
+    mp.write_bytes(json.dumps(_BLIND).encode())
+    args = _cli_args(tmp_path) + ["--canary-map", str(mp)]
+    assert oracle_main.main(args) == 0
+
+    import hashlib
+
+    raw = (tmp_path / "out.json").read_text()
+    data = json.loads(raw)
+    assert data["canary_map_sha256"] == hashlib.sha256(mp.read_bytes()).hexdigest()
+    assert data["baseline"]["vulnerabilities"]["TA-SEC-01"]["exploited"] == 2
+    for blind in _BLIND.values():
+        assert blind not in raw  # contents are not recorded
+    for tok in _CANARY_TOKENS:
+        assert tok not in raw
+
+
+def test_no_canary_map_records_null_digest():
+    res = _run(LeakyTransport(), SecureTransport(), trials=1)
+    assert res["canary_map_sha256"] is None
+
+
+def test_canary_map_unknown_key_rejected(tmp_path, capsys):
+    bad = dict(_BLIND)
+    bad["VIJIL-CANARY-not-in-registry"] = "BLIND-x"
+    with pytest.raises(compare.CanaryMapError, match="VIJIL-CANARY-not-in-registry"):
+        _run_map(LeakyTransport(), SecureTransport(), bad)
+
+    mp = tmp_path / "bad.json"
+    mp.write_text(json.dumps(bad))
+    rc = oracle_main.main(_cli_args(tmp_path) + ["--canary-map", str(mp)])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "VIJIL-CANARY-not-in-registry" in err and "not a canary token" in err
+    assert not (tmp_path / "out.json").exists()
+
+
+def test_canary_map_malformed_rejected(tmp_path):
+    reg = AgentRegistry.from_yaml(_REGISTRY)
+    first = _CANARY_TOKENS[0]
+    with pytest.raises(compare.CanaryMapError, match="JSON object"):
+        compare.validate_canary_map(reg, [first])
+    with pytest.raises(compare.CanaryMapError, match="empty"):
+        compare.validate_canary_map(reg, {first: ""})
+    with pytest.raises(compare.CanaryMapError, match="maps to both"):
+        compare.validate_canary_map(reg, {_CANARY_TOKENS[0]: "same", _CANARY_TOKENS[1]: "same"})
+    p = tmp_path / "x.json"
+    p.write_text("{not json")
+    with pytest.raises(compare.CanaryMapError, match="not valid JSON"):
+        compare.load_canary_map(p, reg)
