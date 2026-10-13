@@ -13,6 +13,11 @@ Usage:
   python -m oracle probe --registry vulnerabilities.yaml \
       --base-url http://localhost:8080
 
+  # A/B-compare a baseline and a variant agent over K independent trials:
+  python -m oracle compare --registry vulnerabilities.yaml \
+      --baseline-url URL --variant-url URL --trials K --out cmp.json \
+      [--markdown cmp.md] [--canary-map blind_map.json] [--allow-errors]
+
 Exit code is non-zero when validation finds issues, so this is CI-usable.
 """
 from __future__ import annotations
@@ -139,6 +144,44 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--base-url", required=True)
     p.add_argument("--model", default="probe")
     p.add_argument("--out", default=None, help="optional path to write transcripts JSON")
+    m = sub.add_parser(
+        "compare",
+        help="A/B-compare baseline vs variant agents over repeated trials",
+        description=(
+            "Fire every probe K times at each agent and compare exploited counts. "
+            "Anything that is not a genuine measurement (transport error, timeout, "
+            "non-200 chat, 5xx, empty/error body, the agent's generic failure reply, "
+            "a malformed probe) is an error, never exploited/not_exploited. Chat "
+            "probes for all trials run before admin_http probes; mutating admin "
+            "probes (POST /admin/goals) change agent behaviour, so RESTART the agents "
+            "(fresh DB) between compare runs."
+        ),
+    )
+    m.add_argument("--registry", required=True)
+    m.add_argument("--baseline-url", required=True)
+    m.add_argument("--variant-url", required=True)
+    m.add_argument("--trials", type=int, required=True, help="independent trials per side (K)")
+    m.add_argument("--out", required=True, help="path to write the comparison JSON")
+    m.add_argument("--markdown", default=None, help="optional path to write a Markdown table")
+    m.add_argument("--model", default="probe")
+    m.add_argument(
+        "--canary-map",
+        default=None,
+        help="JSON {original_token: blind_value}; blind values in responses are "
+        "translated back to the original tokens before grading (both sides)",
+    )
+    m.add_argument(
+        "--error-sentinel",
+        default=None,
+        help="the agent's generic failure reply; a chat answer equal to it is an error "
+        "(default: ERROR_MESSAGE read from agent.py)",
+    )
+    m.add_argument(
+        "--allow-errors",
+        action="store_true",
+        help="exit 0 despite measurement errors (a probe that errored on every trial "
+        "still exits 1)",
+    )
     args = parser.parse_args(argv)
     if args.cmd == "validate":
         return _cmd_validate(args.patterns)
@@ -148,6 +191,18 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_score(args.registry, args.transcripts)
     if args.cmd == "probe":
         return _cmd_probe(args.registry, args.base_url, args.model, args.out)
+    if args.cmd == "compare":
+        if args.trials < 1:
+            parser.error("--trials must be >= 1")
+        if args.error_sentinel is not None and not args.error_sentinel.strip():
+            parser.error("--error-sentinel must be non-empty")
+        from oracle.compare import cmd_compare
+
+        return cmd_compare(
+            args.registry, args.baseline_url, args.variant_url, args.trials,
+            args.out, args.markdown, args.model, args.canary_map,
+            args.error_sentinel, args.allow_errors,
+        )
     return 2  # pragma: no cover
 
 

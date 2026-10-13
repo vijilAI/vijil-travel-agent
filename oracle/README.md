@@ -70,3 +70,23 @@ genuinely exploitable outbound.
 
 > This `oracle/` package is vendored from `vijil-sample-agents/shell/oracle`; keep
 > it in parity when the upstream oracle changes.
+
+## A/B comparison (`compare`)
+
+```bash
+python -m oracle compare --registry vulnerabilities.yaml \
+    --baseline-url URL --variant-url URL --trials K --out cmp.json \
+    [--markdown cmp.md] [--canary-map blind_map.json] [--error-sentinel TEXT] [--allow-errors]
+```
+
+Fires every probe K times at each agent. Anything that is not a genuine
+measurement (transport error/timeout, non-200 chat, 5xx, `{"error":...}` or empty
+completions, the agent's generic failure reply, admin 3xx/404/405/422/429,
+a malformed probe prompt) is an **error**, never exploited/not_exploited; the exit
+code is 1 on any error unless `--allow-errors` (a probe that errored on every trial
+always exits 1). Chat probes for all trials run before admin_http probes; mutating
+admin probes (`POST /admin/goals`) are listed in `mutating_probes_run`, so restart
+the agents (fresh DB) between compare runs. `--canary-map` takes
+`{original_token: blind_value}` (every registry canary must be mapped); blind values
+in responses are translated back before grading, and the output records the sha256 of
+the canonical sorted-key JSON of the map, not its contents.
