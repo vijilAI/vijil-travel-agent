@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
 from uuid import uuid4
 
+from pydantic import BaseModel
 from starlette.responses import JSONResponse
 from strands import Agent
 from strands.models.openai import OpenAIModel
@@ -631,10 +632,15 @@ def create_concurrent_a2a_app(
         task_store=InMemoryTaskStore(),
     )
 
-    app = A2AFastAPIApplication(
+    a2a_application = A2AFastAPIApplication(
         agent_card=agent_card,
         http_handler=request_handler,
-    ).build()
+    )
+    app = a2a_application.build()
+    # The A2A JSON-RPC handler (_handle_requests) lives on the application
+    # object, not on the FastAPI app that build() returns. Keep a reference so
+    # the AgentCore routes can delegate JSON-RPC bodies to it.
+    app.state.a2a_application = a2a_application
 
     return app
 
@@ -675,6 +681,46 @@ def _openai_to_strands_messages(messages: list) -> list[dict]:
     return strands_msgs
 
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+async def run_chat_completion(messages: list[ChatMessage]) -> str | None:
+    """Run the travel agent over an OpenAI-style message list.
+
+    The last user message is the new query; everything before it is conversation
+    history. System messages are skipped (the agent's own system prompt is used).
+    Dome hooks guard input/output inside the Strands Agent.
+
+    Returns the response text, or None when there is no user message. Agent
+    failures are logged and reported as ConcurrentA2AExecutor.ERROR_MESSAGE.
+    """
+    # Find the last user message - that's the new query
+    last_user_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].role == "user":
+            last_user_idx = i
+            break
+
+    if last_user_idx is None:
+        return None
+
+    user_text = messages[last_user_idx].content
+
+    # Everything before the last user message is conversation history
+    history = _openai_to_strands_messages(messages[:last_user_idx])
+
+    # Run Strands agent in thread pool (Dome hooks guard input/output inside Agent)
+    try:
+        agent = create_agent(messages=history if history else None)
+        result = await asyncio.to_thread(agent, user_text)
+        return str(result)
+    except Exception as e:
+        logger.warning(f"Agent execution failed in chat completions: {e}")
+        return ConcurrentA2AExecutor.ERROR_MESSAGE
+
+
 def add_chat_completions_endpoint(app: Any) -> None:
     """Register /v1/chat/completions on the FastAPI app.
 
@@ -687,11 +733,6 @@ def add_chat_completions_endpoint(app: Any) -> None:
     Dome guards are applied at the framework level via DomeHookProvider hooks
     inside the Strands Agent — no manual guard calls needed here.
     """
-    from pydantic import BaseModel
-
-    class ChatMessage(BaseModel):
-        role: str
-        content: str
 
     class ChatCompletionRequest(BaseModel):
         model: str = "llama-3.1-8b-instant"
@@ -701,33 +742,37 @@ def add_chat_completions_endpoint(app: Any) -> None:
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: ChatCompletionRequest):
-        # Find the last user message — that's the new query
-        last_user_idx = None
-        for i in range(len(request.messages) - 1, -1, -1):
-            if request.messages[i].role == "user":
-                last_user_idx = i
-                break
+        response_text = await run_chat_completion(request.messages)
 
-        if last_user_idx is None:
+        if response_text is None:
             return JSONResponse(status_code=400, content={"error": "No user message found"})
-
-        user_text = request.messages[last_user_idx].content
-
-        # Everything before the last user message is conversation history
-        history = _openai_to_strands_messages(request.messages[:last_user_idx])
-
-        # Run Strands agent in thread pool (Dome hooks guard input/output inside Agent)
-        try:
-            agent = create_agent(messages=history if history else None)
-            result = await asyncio.to_thread(agent, user_text)
-            response_text = str(result)
-        except Exception as e:
-            logger.warning(f"Agent execution failed in chat completions: {e}")
-            response_text = ConcurrentA2AExecutor.ERROR_MESSAGE
 
         return _chat_response(response_text, model=request.model)
 
     logger.info("Chat completions endpoint registered at /v1/chat/completions")
+
+
+async def _agentcore_chat(messages: list[dict], system_prompt: str | None = None) -> str:
+    """Chat handler for the AgentCore routes.
+
+    Calls the same coroutine as /v1/chat/completions. As there, the agent's own
+    system prompt (genome-aware, per request) is used; a ``system_prompt`` in the
+    request body and system-role messages are not applied.
+    """
+    text = await run_chat_completion([ChatMessage(**m) for m in messages])
+    # register_agentcore_routes only dispatches bodies with a user message.
+    return text if text is not None else ConcurrentA2AExecutor.ERROR_MESSAGE
+
+
+def add_agentcore_endpoints(app: Any) -> None:
+    """Register the AgentCore HTTP contract (POST /invocations, POST /, GET /ping)."""
+    from agentcore_routes import register_agentcore_routes
+
+    register_agentcore_routes(
+        app,
+        handler=_agentcore_chat,
+        a2a_app=getattr(app.state, "a2a_application", None),
+    )
 
 
 # =============================================================================
@@ -779,7 +824,8 @@ def main():
     logger.info("Seed data loaded")
 
     host = "0.0.0.0"
-    port = 9000
+    # AgentCore code-mode deploys set PORT (Darwin uses 8080); default unchanged.
+    port = int(os.environ.get("PORT", "9000"))
 
     # Create concurrent A2A app (FastAPI for both modes)
     app = create_concurrent_a2a_app(create_agent, host, port)
@@ -845,6 +891,9 @@ def main():
     # Register chat completions endpoint
     add_chat_completions_endpoint(app)
 
+    # Register AgentCore HTTP contract (POST /invocations, POST /, GET /ping)
+    add_agentcore_endpoints(app)
+
     # Mount admin API (intentionally unauthenticated)
     from routes.admin import router as admin_router
     app.include_router(admin_router)
@@ -870,6 +919,7 @@ def main():
         print(f"Agent ID:   {AGENT_ID}")
     print(f"A2A Server: http://localhost:{port}")
     print(f"Chat API:   http://localhost:{port}/v1/chat/completions")
+    print(f"AgentCore:  http://localhost:{port}/invocations  (GET /ping)")
     print(f"Admin API:  http://localhost:{port}/admin/config")
     print(f"Agent Card: http://localhost:{port}/.well-known/agent.json")
     print("Concurrency: ENABLED (fresh agent per request)")

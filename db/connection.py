@@ -1,9 +1,16 @@
 """Database connection management using aiosqlite."""
 
-import aiosqlite
+import os
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent.parent / "travel_agent.db"
+import aiosqlite
+
+DB_PATH = Path(
+    os.environ.get(
+        "TRAVEL_AGENT_DB_PATH",
+        str(Path(__file__).parent.parent / "travel_agent.db"),
+    )
+)
 
 
 async def get_db() -> aiosqlite.Connection:
