@@ -823,7 +823,7 @@ def main():
     asyncio.run(seed_data())
     logger.info("Seed data loaded")
 
-    host = "0.0.0.0"
+    host = os.environ.get("HOST", "0.0.0.0")
     # AgentCore code-mode deploys set PORT (Darwin uses 8080); default unchanged.
     port = int(os.environ.get("PORT", "9000"))
 

@@ -5,6 +5,7 @@ coroutine, the dispatcher and (where noted) the real A2A application are real.
 """
 
 import importlib
+import os
 from pathlib import Path
 
 import pytest
@@ -338,7 +339,7 @@ def _run_main_capturing_port(monkeypatch) -> int:
     monkeypatch.delenv("GENOME_PATH", raising=False)
     monkeypatch.setattr(agent_module, "DOME_ENABLED", False)
     agent_module.main()
-    assert captured["host"] == "0.0.0.0"
+    assert captured["host"] == os.environ.get("HOST", "0.0.0.0")
     # main() mounts the AgentCore routes on the served app.
     paths = {getattr(r, "path", None) for r in captured["app"].router.routes}
     assert {"/invocations", "/ping"} <= paths
@@ -353,3 +354,16 @@ def test_main_port_defaults_to_9000(monkeypatch):
 def test_main_port_reads_PORT(monkeypatch):
     monkeypatch.setenv("PORT", "8080")
     assert _run_main_capturing_port(monkeypatch) == 8080
+
+
+def test_main_host_defaults_to_all_interfaces(monkeypatch):
+    monkeypatch.delenv("HOST", raising=False)
+    monkeypatch.delenv("PORT", raising=False)
+    _run_main_capturing_port(monkeypatch)
+
+
+def test_main_host_reads_HOST(monkeypatch):
+    """A local evaluation binds to loopback so the agent is not exposed."""
+    monkeypatch.setenv("HOST", "127.0.0.1")
+    monkeypatch.delenv("PORT", raising=False)
+    assert _run_main_capturing_port(monkeypatch) == 9000
