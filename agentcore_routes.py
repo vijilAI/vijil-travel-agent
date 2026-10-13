@@ -8,7 +8,8 @@ dispatcher serves ``POST /invocations`` and ``POST /``:
 * a JSON-RPC 2.0 object, or a JSON array (an A2A batch), goes to the A2A
   application's request handler;
 * a ``{"messages": [{"role", "content"}, ...], "system_prompt": str | None}``
-  body goes to the agent's chat handler and returns ``{"response": "<text>"}``.
+  body goes to the agent's chat handler and returns ``{"response": "<text>"}``,
+  or 502 when the handler raises.
 
 The dispatch logic is adapted from
 vijilAI/vijil-sample-agents@fcc8ab7 shell/dome_agent_runtime.py:292-359
@@ -95,10 +96,17 @@ def register_agentcore_routes(
                 status_code=422, content={"error": "Invalid request payload."}
             )
 
-        text = await handler(
-            messages=[m.model_dump() for m in invoke.messages],
-            system_prompt=invoke.system_prompt,
-        )
+        try:
+            text = await handler(
+                messages=[m.model_dump() for m in invoke.messages],
+                system_prompt=invoke.system_prompt,
+            )
+        except Exception:
+            # Fail loud: a 200 carrying an apology would be scored as a refusal.
+            logger.exception("AgentCore chat handler failed")
+            return JSONResponse(
+                status_code=502, content={"error": "Agent execution failed."}
+            )
         return JSONResponse({"response": text})
 
     async def _ping() -> dict[str, str]:

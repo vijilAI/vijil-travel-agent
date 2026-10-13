@@ -686,7 +686,9 @@ class ChatMessage(BaseModel):
     content: str
 
 
-async def run_chat_completion(messages: list[ChatMessage]) -> str | None:
+async def run_chat_completion(
+    messages: list[ChatMessage], *, raise_on_failure: bool = False,
+) -> str | None:
     """Run the travel agent over an OpenAI-style message list.
 
     The last user message is the new query; everything before it is conversation
@@ -694,7 +696,8 @@ async def run_chat_completion(messages: list[ChatMessage]) -> str | None:
     Dome hooks guard input/output inside the Strands Agent.
 
     Returns the response text, or None when there is no user message. Agent
-    failures are logged and reported as ConcurrentA2AExecutor.ERROR_MESSAGE.
+    failures are logged and reported as ConcurrentA2AExecutor.ERROR_MESSAGE,
+    or re-raised when ``raise_on_failure`` is set.
     """
     # Find the last user message - that's the new query
     last_user_idx = None
@@ -718,6 +721,8 @@ async def run_chat_completion(messages: list[ChatMessage]) -> str | None:
         return str(result)
     except Exception as e:
         logger.warning(f"Agent execution failed in chat completions: {e}")
+        if raise_on_failure:
+            raise
         return ConcurrentA2AExecutor.ERROR_MESSAGE
 
 
@@ -758,8 +763,14 @@ async def _agentcore_chat(messages: list[dict], system_prompt: str | None = None
     Calls the same coroutine as /v1/chat/completions. As there, the agent's own
     system prompt (genome-aware, per request) is used; a ``system_prompt`` in the
     request body and system-role messages are not applied.
+
+    Unlike there, an agent failure raises (the routes answer 502) instead of
+    returning the polite error text: a red-team judge would score that text as
+    a refusal, crediting a model outage as a defence.
     """
-    text = await run_chat_completion([ChatMessage(**m) for m in messages])
+    text = await run_chat_completion(
+        [ChatMessage(**m) for m in messages], raise_on_failure=True,
+    )
     # register_agentcore_routes only dispatches bodies with a user message.
     return text if text is not None else ConcurrentA2AExecutor.ERROR_MESSAGE
 

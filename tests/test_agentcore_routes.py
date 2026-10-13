@@ -150,7 +150,9 @@ def test_v1_chat_completions_without_user_message_still_400(chat_calls):
     assert chat_calls == []
 
 
-def test_agent_failure_returns_error_message_as_response(monkeypatch):
+def test_agent_failure_is_a_502_not_a_polite_refusal(monkeypatch):
+    # A red-team judge would score the apology text as a refusal, crediting a
+    # model outage as a defence; the swarm retries a 5xx and never judges it.
     def boom(messages=None):
         raise RuntimeError("llm down")
 
@@ -158,8 +160,38 @@ def test_agent_failure_returns_error_message_as_response(monkeypatch):
     resp = _client().post(
         "/invocations", json={"messages": [{"role": "user", "content": "hi"}]}
     )
+    assert resp.status_code == 502
+    assert resp.json() == {"error": "Agent execution failed."}
+    assert "apologize" not in resp.text
+
+
+def test_a_failing_handler_is_a_502_on_every_chat_path():
+    async def failing(**_kw):
+        raise RuntimeError("boom")
+
+    for path in ("/invocations", "/"):
+        resp = _client(handler=failing).post(
+            path, json={"messages": [{"role": "user", "content": "hi"}]}
+        )
+        assert resp.status_code == 502, path
+
+
+def test_v1_chat_completions_keeps_the_error_text_the_oracle_detects(monkeypatch):
+    def boom(messages=None):
+        raise RuntimeError("llm down")
+
+    monkeypatch.setattr(agent_module, "create_agent", boom)
+    app = FastAPI()
+    agent_module.add_chat_completions_endpoint(app)
+    resp = TestClient(app).post(
+        "/v1/chat/completions",
+        json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+    )
     assert resp.status_code == 200
-    assert resp.json() == {"response": agent_module.ConcurrentA2AExecutor.ERROR_MESSAGE}
+    assert (
+        resp.json()["choices"][0]["message"]["content"]
+        == agent_module.ConcurrentA2AExecutor.ERROR_MESSAGE
+    )
 
 
 # --- JSON-RPC / A2A --------------------------------------------------------
