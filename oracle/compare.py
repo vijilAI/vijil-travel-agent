@@ -1,14 +1,27 @@
 """A/B comparison of two live agents (baseline vs variant) with repeated trials.
 
-For each side and each trial, every probe in the registry is fired as an
-independent request set (a fresh transport per trial, and ``HttpTransport``
-sends a single-message conversation per call, so no conversation state carries
-over) and graded with the existing deterministic checker
-(:func:`oracle.checker.evaluate_probe`). Probing is delegated to
-:func:`oracle.probe_runner.run_probe`; verdict semantics are unchanged.
+Every probe in the registry is fired K times against each side (a fresh
+transport per trial and phase; ``chat`` sends a single-message conversation per
+call, so no conversation state carries over) and graded with the existing
+deterministic checker (:func:`oracle.checker.evaluate_probe`). Probing is
+delegated to :func:`oracle.probe_runner.run_probe`; verdict semantics are
+unchanged.
 
-Fail closed: a transport exception, timeout, or HTTP 5xx is recorded as an
-``error`` and is never counted as ``not_exploited``. A vulnerability trial is
+Fail closed. These numbers are shown to prospects, so anything that is not a
+genuine measurement of the agent's answer is an ``error`` and is never counted
+as ``exploited`` or ``not_exploited``:
+
+  * transport exceptions and timeouts;
+  * chat: any status other than 200, a non-JSON body, a top-level ``error``
+    key, missing/empty ``choices[0].message.content``, or the agent's generic
+    failure reply (the ``--error-sentinel`` text);
+  * admin_http: 3xx, 404, 405, 422, 429, 5xx and any other status outside
+    2xx/401/403 (401/403 are legitimate measured responses -- an auth fix
+    produces them);
+  * a transcript whose text starts with ``<probe error:`` (a malformed
+    ``admin_http`` probe prompt that never reached the agent).
+
+A vulnerability trial is
 
   * ``exploited``     -- any of its probes disclosed the weakness (positive
                          evidence stands even if another probe errored);
@@ -17,9 +30,20 @@ Fail closed: a transport exception, timeout, or HTTP 5xx is recorded as an
   * ``not_exploited`` -- else (every probe completed and none disclosed).
 
 So ``exploited + not_exploited + errors == trials`` for every vulnerability.
+
+Execution order: for each side, all chat probes for all trials run first, then
+the admin_http probes, because a mutating admin probe (e.g. ``POST
+/admin/goals``) changes the agent's behaviour for every later request. The
+mutating probes that ran are listed under ``mutating_probes_run``; restart the
+agent (fresh DB) between compare runs.
+
+``canary_map_sha256`` is the sha256 of the canonical map JSON
+(``json.dumps(map, sort_keys=True, separators=(",", ":"))``), identical for the
+CLI and API paths.
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
@@ -30,39 +54,122 @@ from typing import Any
 
 from oracle.canary import token as canary_token
 from oracle.checker import evaluate_probe
-from oracle.probe_runner import HttpTransport, Transport, run_probe
+from oracle.probe_runner import HttpTransport, Transport, parse_admin_prompt, run_probe
 from oracle.registry import AgentRegistry
 
 EXPLOITED = "exploited"
 NOT_EXPLOITED = "not_exploited"
 ERROR = "error"
 
+PROBE_ERROR_PREFIX = "<probe error:"
+MIN_BLIND_LEN = 12
+_CASE_INSENSITIVE_PREFIXES = ("sk_live_", "ovr-")
+
 TransportFactory = Callable[[], Transport]
 
 
 class TransportError(Exception):
-    """Raised for an HTTP 5xx response so it cannot be mistaken for a clean miss."""
+    """A response that is not a genuine measurement of the agent's answer."""
 
 
-async def _raise_on_5xx(response: Any) -> None:
-    if response.status_code >= 500:
-        raise TransportError(
-            f"HTTP {response.status_code} from {response.request.method} {response.request.url}"
-        )
+class SentinelError(Exception):
+    """The agent's generic failure reply could not be determined."""
+
+
+# --------------------------------------------------------------------------
+# Fail-closed HTTP transport
+# --------------------------------------------------------------------------
+
+_ADMIN_MEASURED_STATUSES = frozenset({401, 403})
+
+
+def default_error_sentinel(agent_py: str | Path | None = None) -> str:
+    """The agent's generic failure reply: ``ERROR_MESSAGE`` in ``agent.py``.
+
+    Read statically (``ast``) so no agent dependencies are imported.
+    """
+    path = Path(agent_py) if agent_py else Path(__file__).resolve().parent.parent / "agent.py"
+    try:
+        tree = ast.parse(path.read_text())
+    except (OSError, SyntaxError) as exc:
+        raise SentinelError(
+            f"cannot read ERROR_MESSAGE from {path} ({exc}); pass --error-sentinel"
+        ) from exc
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "ERROR_MESSAGE" for t in node.targets
+        ):
+            try:
+                value = ast.literal_eval(node.value)
+            except ValueError:
+                continue
+            if isinstance(value, str) and value:
+                return value
+    raise SentinelError(f"no ERROR_MESSAGE string constant in {path}; pass --error-sentinel")
 
 
 class FailClosedHttpTransport(HttpTransport):
-    """``HttpTransport`` that turns any 5xx response into a ``TransportError``.
+    """``HttpTransport`` where only genuine measurements are returned.
 
-    ``HttpTransport.chat`` deliberately swallows non-JSON error bodies into a
-    transcript; for a comparison that would turn a server failure into a
-    not-exploited verdict, so a response hook raises instead. Timeouts and
-    connection errors already propagate as httpx exceptions.
+    ``HttpTransport.chat`` turns 4xx pages, ``{"error": ...}`` bodies and empty
+    completions into text that would be graded as a clean miss (or even a hit),
+    so ``chat`` and ``admin`` are re-implemented here to raise
+    :class:`TransportError` for anything that is not a real answer.
     """
 
-    def __init__(self, base_url: str, *, model: str = "probe", timeout: float = 60.0) -> None:
-        super().__init__(base_url, model=model, timeout=timeout)
-        self._client.event_hooks = {"request": [], "response": [_raise_on_5xx]}
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        model: str = "probe",
+        timeout: float = 60.0,
+        error_sentinel: str | None = None,
+        httpx_transport: Any = None,
+    ) -> None:
+        import httpx
+
+        self._base = base_url.rstrip("/")
+        self._model = model
+        self._error_sentinel = error_sentinel.strip() if error_sentinel else None
+        self._client = httpx.AsyncClient(timeout=timeout, transport=httpx_transport)
+
+    async def chat(self, prompt: str, system_prompt: str | None = None) -> str:
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        resp = await self._client.post(
+            f"{self._base}/v1/chat/completions",
+            json={"model": self._model, "messages": messages},
+        )
+        if resp.status_code != 200:
+            raise TransportError(f"chat HTTP {resp.status_code}")
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise TransportError("chat: 200 response is not JSON") from exc
+        if not isinstance(data, dict):
+            raise TransportError("chat: JSON body is not an object")
+        if "error" in data:
+            raise TransportError("chat: response carries a top-level 'error'")
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise TransportError("chat: no choices[0].message.content") from exc
+        if not isinstance(content, str) or not content.strip():
+            raise TransportError("chat: empty or non-string completion content")
+        if self._error_sentinel is not None and content.strip() == self._error_sentinel:
+            raise TransportError("chat: agent returned its generic failure reply")
+        return content
+
+    async def admin(self, method: str, path: str, body: dict | None) -> tuple[int, str]:
+        resp = await self._client.request(
+            method, f"{self._base}{path}", json=body if body is not None else None
+        )
+        code = resp.status_code
+        if not (200 <= code < 300 or code in _ADMIN_MEASURED_STATUSES):
+            raise TransportError(f"admin {method} {path}: HTTP {code} is not a measurement")
+        return code, resp.text
 
 
 def _now() -> str:
@@ -73,8 +180,13 @@ def registry_digest(path: str | Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+# --------------------------------------------------------------------------
+# Canary map (blind deployments)
+# --------------------------------------------------------------------------
+
+
 class CanaryMapError(ValueError):
-    """The canary map file is malformed or names a token the registry does not declare."""
+    """The canary map is malformed or unsafe for this registry."""
 
 
 def registry_canary_tokens(registry: AgentRegistry) -> set[str]:
@@ -85,11 +197,27 @@ def registry_canary_tokens(registry: AgentRegistry) -> set[str]:
     }
 
 
+def canary_map_digest(canary_map: dict[str, str]) -> str:
+    """sha256 of the canonical (sorted, compact) JSON of the map."""
+    canonical = json.dumps(canary_map, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 def validate_canary_map(registry: AgentRegistry, canary_map: Any) -> dict[str, str]:
-    """Check ``{original_token: blind_value}`` against the registry's canaries."""
+    """Check ``{original_token: blind_value}`` against the registry.
+
+    Every registry canary must be mapped, and every blind value must be long,
+    unambiguous, and unable to collide with registry text or another value.
+    """
     if not isinstance(canary_map, dict):
         raise CanaryMapError("canary map must be a JSON object {original_token: blind_value}")
     known = registry_canary_tokens(registry)
+    texts: list[str] = []
+    for v in registry.vulnerabilities:
+        for p in v.probes:
+            texts.append(p.prompt.lower())
+            texts.extend(c.value.lower() for c in p.oracle if c.value)
+
     seen: dict[str, str] = {}
     for original, blind in canary_map.items():
         if not isinstance(original, str) or not isinstance(blind, str):
@@ -99,24 +227,53 @@ def validate_canary_map(registry: AgentRegistry, canary_map: Any) -> dict[str, s
                 f"canary map key {original!r} is not a canary token declared by registry "
                 f"agent {registry.agent!r}"
             )
-        if not blind:
-            raise CanaryMapError(f"canary map value for {original!r} is empty")
+        if len(blind) < MIN_BLIND_LEN:
+            raise CanaryMapError(
+                f"blind value for {original!r} is shorter than {MIN_BLIND_LEN} characters"
+            )
+        if blind in known:
+            raise CanaryMapError(f"blind value for {original!r} is itself a registry token")
+        low = blind.lower()
+        if any(low in t for t in texts):
+            raise CanaryMapError(
+                f"blind value for {original!r} occurs in a probe prompt or registry oracle value"
+            )
         if blind in seen and seen[blind] != original:
             raise CanaryMapError(
                 f"blind value {blind!r} maps to both {seen[blind]!r} and {original!r}"
             )
         seen[blind] = original
+    blinds = list(seen)
+    for a in blinds:
+        for b in blinds:
+            if a is not b and a != b and a.lower() in b.lower():
+                raise CanaryMapError(
+                    f"blind value {a!r} (for {seen[a]!r}) is a substring of another blind "
+                    f"value ({b!r} for {seen[b]!r})"
+                )
+    missing = sorted(known - set(canary_map))
+    if missing:
+        raise CanaryMapError("canary map is missing registry canary token(s): " + ", ".join(missing))
     return dict(canary_map)
 
 
-def load_canary_map(path: str | Path, registry: AgentRegistry) -> tuple[dict[str, str], str]:
-    """Load and validate a canary map file; returns (map, sha256 of the file bytes)."""
-    raw = Path(path).read_bytes()
+def load_canary_map(path: str | Path, registry: AgentRegistry) -> dict[str, str]:
+    """Load and validate a canary map file."""
     try:
-        data = json.loads(raw)
+        data = json.loads(Path(path).read_bytes())
     except json.JSONDecodeError as exc:
         raise CanaryMapError(f"canary map {path} is not valid JSON: {exc}") from exc
-    return validate_canary_map(registry, data), hashlib.sha256(raw).hexdigest()
+    return validate_canary_map(registry, data)
+
+
+def _blind_pattern(blind: str) -> str:
+    """Regex for one blind value, tolerant of common reformatting by the model."""
+    if blind.isdigit():
+        # "4451014480034591" also matches "4451 0144 8003 4591" / "4451-0144-...".
+        return "[ -]?".join(re.escape(ch) for ch in blind)
+    if blind.lower().startswith(_CASE_INSENSITIVE_PREFIXES):
+        return f"(?i:{re.escape(blind)})"
+    return re.escape(blind)
 
 
 def make_translator(canary_map: dict[str, str] | None) -> Callable[[str], str]:
@@ -127,35 +284,49 @@ def make_translator(canary_map: dict[str, str] | None) -> Callable[[str], str]:
     """
     if not canary_map:
         return lambda text: text
-    reverse = {blind: original for original, blind in canary_map.items()}
-    pattern = re.compile(
-        "|".join(re.escape(b) for b in sorted(reverse, key=len, reverse=True))
-    )
-    return lambda text: pattern.sub(lambda m: reverse[m.group(0)], text)
+    by_group: dict[str, str] = {}
+    parts: list[str] = []
+    for i, (blind, original) in enumerate(
+        sorted(((b, o) for o, b in canary_map.items()), key=lambda bo: len(bo[0]), reverse=True)
+    ):
+        by_group[f"g{i}"] = original
+        parts.append(f"(?P<g{i}>{_blind_pattern(blind)})")
+    pattern = re.compile("|".join(parts))
+    return lambda text: pattern.sub(lambda m: by_group[m.lastgroup or ""], text)
 
 
-async def _run_side_trial(
+# --------------------------------------------------------------------------
+# Running
+# --------------------------------------------------------------------------
+
+
+def _is_mutating(probe: Any) -> bool:
+    if probe.channel != "admin_http":
+        return False
+    try:
+        method, _, _ = parse_admin_prompt(probe.prompt)
+    except ValueError:
+        return False  # never sent
+    return method not in ("GET", "HEAD", "OPTIONS")
+
+
+async def _measure(
     registry: AgentRegistry,
+    vuln_id: str,
+    probe: Any,
     transport: Transport,
-    translate: Callable[[str], str] = lambda text: text,
-) -> dict[str, tuple[str, str]]:
-    """One trial on one side: {probe_id: (verdict, detail)}."""
-    out: dict[str, tuple[str, str]] = {}
-    for vuln in registry.vulnerabilities:
-        for probe in vuln.probes:
-            try:
-                transcript = await run_probe(probe, transport)
-            except Exception as exc:  # noqa: BLE001 - every failure is an error verdict
-                out[probe.id] = (ERROR, f"{type(exc).__name__}: {exc}")
-                continue
-            transcript = transcript.model_copy(
-                update={"response_text": translate(transcript.response_text or "")}
-            )
-            result = evaluate_probe(
-                probe, transcript, namespace=registry.agent, vuln_id=vuln.id
-            )
-            out[probe.id] = (EXPLOITED if result.disclosed else NOT_EXPLOITED, "")
-    return out
+    translate: Callable[[str], str],
+) -> tuple[str, str]:
+    try:
+        transcript = await run_probe(probe, transport)
+    except Exception as exc:  # noqa: BLE001 - every failure is an error verdict
+        return ERROR, f"{type(exc).__name__}: {exc}"
+    text = transcript.response_text or ""
+    if text.startswith(PROBE_ERROR_PREFIX):
+        return ERROR, text
+    transcript = transcript.model_copy(update={"response_text": translate(text)})
+    result = evaluate_probe(probe, transcript, namespace=registry.agent, vuln_id=vuln_id)
+    return (EXPLOITED if result.disclosed else NOT_EXPLOITED), ""
 
 
 async def run_side(
@@ -169,20 +340,28 @@ async def run_side(
     """Run ``trials`` independent trials against one side and aggregate."""
     started = _now()
     translate = make_translator(canary_map)
-    probe_verdicts: dict[str, list[str]] = {}
+    pairs = [(v.id, p) for v in registry.vulnerabilities for p in v.probes]
+    chat_pairs = [(vid, p) for vid, p in pairs if p.channel != "admin_http"]
+    admin_pairs = [(vid, p) for vid, p in pairs if p.channel == "admin_http"]
+
+    probe_verdicts: dict[str, list[str]] = {p.id: [] for _, p in pairs}
     probe_errors: dict[str, list[str]] = {}
-    for _ in range(trials):
-        transport = factory()  # fresh transport (client, cookies) per trial
-        try:
-            trial = await _run_side_trial(registry, transport, translate)
-        finally:
-            aclose = getattr(transport, "aclose", None)
-            if aclose is not None:
-                await aclose()
-        for pid, (verdict, detail) in trial.items():
-            probe_verdicts.setdefault(pid, []).append(verdict)
-            if verdict == ERROR:
-                probe_errors.setdefault(pid, []).append(detail)
+    # Chat first, for every trial; mutating admin probes only afterwards.
+    for phase in (chat_pairs, admin_pairs):
+        if not phase:
+            continue
+        for _ in range(trials):
+            transport = factory()  # fresh transport (client, cookies) per trial
+            try:
+                for vid, probe in phase:
+                    verdict, detail = await _measure(registry, vid, probe, transport, translate)
+                    probe_verdicts[probe.id].append(verdict)
+                    if verdict == ERROR:
+                        probe_errors.setdefault(probe.id, []).append(detail)
+            finally:
+                aclose = getattr(transport, "aclose", None)
+                if aclose is not None:
+                    await aclose()
 
     vulns: dict[str, Any] = {}
     for vuln in registry.vulnerabilities:
@@ -208,7 +387,14 @@ async def run_side(
                 for p in vuln.probes
             },
         }
-    return {"url": url, "started_at": started, "finished_at": _now(), "vulnerabilities": vulns}
+    return {
+        "url": url,
+        "started_at": started,
+        "finished_at": _now(),
+        "mutating_probes_run": [p.id for _, p in admin_pairs if _is_mutating(p)],
+        "probe_error_count": sum(len(d) for d in probe_errors.values()),
+        "vulnerabilities": vulns,
+    }
 
 
 def probes_all_errored(side: dict[str, Any]) -> list[str]:
@@ -231,20 +417,21 @@ async def run_compare(
     baseline_url: str = "",
     variant_url: str = "",
     canary_map: dict[str, str] | None = None,
-    canary_map_sha256: str | None = None,
+    error_sentinel: str | None = None,
 ) -> dict[str, Any]:
-    """Run the comparison. ``canary_map`` ({original_token: blind_value}) is
-    applied to both sides' responses before grading; only its sha256 is recorded."""
+    """Run the comparison.
+
+    ``canary_map`` ({original_token: blind_value}) is applied to both sides'
+    responses before grading; only its canonical sha256 is recorded.
+    ``error_sentinel`` is recorded (it is enforced by the transport factories).
+    """
     if trials < 1:
         raise ValueError("trials must be >= 1")
     registry = AgentRegistry.from_yaml(registry_path)
+    map_sha: str | None = None
     if canary_map is not None:
         canary_map = validate_canary_map(registry, canary_map)
-        if canary_map_sha256 is None:
-            canonical = json.dumps(canary_map, sort_keys=True).encode()
-            canary_map_sha256 = hashlib.sha256(canonical).hexdigest()
-    else:
-        canary_map_sha256 = None
+        map_sha = canary_map_digest(canary_map)
     started = _now()
     baseline = await run_side(
         registry, baseline_factory, trials, url=baseline_url, canary_map=canary_map
@@ -258,10 +445,14 @@ async def run_compare(
             "sha256": registry_digest(registry_path),
             "agent": registry.agent,
         },
-        "canary_map_sha256": canary_map_sha256,
+        "canary_map_sha256": map_sha,
+        "error_sentinel": error_sentinel,
         "trials": trials,
         "started_at": started,
         "finished_at": _now(),
+        "mutating_probes_run": sorted(
+            set(baseline["mutating_probes_run"]) | set(variant["mutating_probes_run"])
+        ),
         "vulnerabilities": {
             v.id: {
                 "title": v.title,
@@ -273,6 +464,11 @@ async def run_compare(
         },
         "baseline": baseline,
         "variant": variant,
+        "measurement_errors": {
+            "baseline": baseline["probe_error_count"],
+            "variant": variant["probe_error_count"],
+            "total": baseline["probe_error_count"] + variant["probe_error_count"],
+        },
         "all_error_probes": {
             "baseline": probes_all_errored(baseline),
             "variant": probes_all_errored(variant),
@@ -280,8 +476,20 @@ async def run_compare(
     }
 
 
+def error_banner(result: dict[str, Any]) -> str | None:
+    n = result["measurement_errors"]["total"]
+    return f"WARNING: {n} measurement errors — counts exclude them" if n else None
+
+
 def _cell(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ")
+
+
+def _exploited_cell(vuln: dict[str, Any], k: int) -> str:
+    e = vuln["errors"]
+    if e:
+        return f"{vuln['exploited']}/{k - e} ({e} err)"
+    return f"{vuln['exploited']}/{k}"
 
 
 def render_markdown(result: dict[str, Any]) -> str:
@@ -292,6 +500,11 @@ def render_markdown(result: dict[str, Any]) -> str:
         "",
         f"Registry `{reg['path']}` sha256 `{reg['sha256']}`; {k} trial(s) per side.",
         "",
+    ]
+    banner = error_banner(result)
+    if banner:
+        lines += [f"**{banner}**", ""]
+    lines += [
         (
             "| Vuln | Dimension | Severity | Location | Baseline exploited | "
             "Variant exploited | Errors (b/v) |"
@@ -303,7 +516,7 @@ def render_markdown(result: dict[str, Any]) -> str:
         v = result["variant"]["vulnerabilities"][vid]
         lines.append(
             f"| {_cell(vid)} | {_cell(meta['dimension'])} | {_cell(meta['severity'])} | "
-            f"{_cell(meta['location'])} | {b['exploited']}/{k} | {v['exploited']}/{k} | "
+            f"{_cell(meta['location'])} | {_exploited_cell(b, k)} | {_exploited_cell(v, k)} | "
             f"{b['errors']}/{v['errors']} |"
         )
     bad = result["all_error_probes"]
@@ -316,12 +529,20 @@ def render_markdown(result: dict[str, Any]) -> str:
                 f"variant: {', '.join(bad['variant']) or 'none'}"
             ),
         ]
+    if result["mutating_probes_run"]:
+        lines += [
+            "",
+            "Mutating probes run: " + ", ".join(result["mutating_probes_run"])
+            + ". Restart the agents (fresh DB) before the next compare run.",
+        ]
     return "\n".join(lines) + "\n"
 
 
-def make_http_transport(url: str, model: str) -> TransportFactory:
+def make_http_transport(
+    url: str, model: str, error_sentinel: str | None = None
+) -> TransportFactory:
     def _factory() -> Transport:
-        return FailClosedHttpTransport(url, model=model)
+        return FailClosedHttpTransport(url, model=model, error_sentinel=error_sentinel)
 
     return _factory
 
@@ -335,33 +556,40 @@ def cmd_compare(
     markdown: str | None,
     model: str = "probe",
     canary_map_path: str | None = None,
+    error_sentinel: str | None = None,
+    allow_errors: bool = False,
 ) -> int:
-    """CLI body. Exit 1 if any side errored on every trial of some probe;
-    exit 2 if the canary map is invalid."""
+    """CLI body.
+
+    Exit 2: invalid canary map / unreadable sentinel. Exit 1: any measurement
+    error (unless ``allow_errors``), or -- always -- a probe that errored on
+    every trial of either side.
+    """
     import asyncio
     import sys
 
-    canary_map: dict[str, str] | None = None
-    canary_sha: str | None = None
-    if canary_map_path:
-        try:
-            canary_map, canary_sha = load_canary_map(
-                canary_map_path, AgentRegistry.from_yaml(registry)
-            )
-        except (CanaryMapError, OSError) as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
+    try:
+        if error_sentinel is None:
+            error_sentinel = default_error_sentinel()
+        canary_map = (
+            load_canary_map(canary_map_path, AgentRegistry.from_yaml(registry))
+            if canary_map_path
+            else None
+        )
+    except (CanaryMapError, SentinelError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     result = asyncio.run(
         run_compare(
             registry,
-            make_http_transport(baseline_url, model),
-            make_http_transport(variant_url, model),
+            make_http_transport(baseline_url, model, error_sentinel),
+            make_http_transport(variant_url, model, error_sentinel),
             trials,
             baseline_url=baseline_url,
             variant_url=variant_url,
             canary_map=canary_map,
-            canary_map_sha256=canary_sha,
+            error_sentinel=error_sentinel,
         )
     )
     Path(out).write_text(json.dumps(result, indent=2) + "\n")
@@ -369,11 +597,18 @@ def cmd_compare(
     if markdown:
         Path(markdown).write_text(md)
     print(md)
+    banner = error_banner(result)
+    if banner:
+        print(banner, file=sys.stderr)
     bad = result["all_error_probes"]
     if bad["baseline"] or bad["variant"]:
         print(
             f"FAIL: probes errored on every trial -- baseline={bad['baseline']} "
-            f"variant={bad['variant']}"
+            f"variant={bad['variant']}",
+            file=sys.stderr,
         )
+        return 1
+    if banner and not allow_errors:
+        print("FAIL: measurement errors present (use --allow-errors to accept)", file=sys.stderr)
         return 1
     return 0
