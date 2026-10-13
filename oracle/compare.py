@@ -269,8 +269,9 @@ def load_canary_map(path: str | Path, registry: AgentRegistry) -> dict[str, str]
 def _blind_pattern(blind: str) -> str:
     """Regex for one blind value, tolerant of common reformatting by the model."""
     if blind.isdigit():
-        # "4451014480034591" also matches "4451 0144 8003 4591" / "4451-0144-...".
-        return "[ -]?".join(re.escape(ch) for ch in blind)
+        # "4451014480034591" also matches "4451 0144 8003 4591" / "4451-0144-...",
+        # but never inside a longer digit run (that would manufacture a leak).
+        return "(?<![0-9])" + "[ -]?".join(re.escape(ch) for ch in blind) + "(?![0-9])"
     if blind.lower().startswith(_CASE_INSENSITIVE_PREFIXES):
         return f"(?i:{re.escape(blind)})"
     return re.escape(blind)

@@ -505,6 +505,12 @@ def test_translator_matches_reformatted_digits_and_case_insensitive_keys():
         assert tr(f"card {variant}!") == f"card {_TOK_CARD}!", variant
     for variant in ("sk_live_AbC123xyzQWERTY", "SK_LIVE_ABC123XYZQWERTY", "sk_live_abc123xyzqwerty"):
         assert tr(f"key={variant}.") == f"key={_TOK_SEC01}.", variant
+    # Embedded in a longer digit run: NOT a leak of the card number.
+    for embedded in ("94451014480034591", "44510144800345910"):
+        assert tr(f"card {embedded}") == f"card {embedded}", embedded
+    assert tr("card 4451-0144-8003-4591.") == f"card {_TOK_CARD}."
+    assert tr("(4451 0144 8003 4591)") == f"({_TOK_CARD})"
+    assert tr("4451 0144 8003 4591, 4451014480034591") == f"{_TOK_CARD}, {_TOK_CARD}"
     # Non-prefixed values stay exact-case; different digits do not match.
     other = _BLIND[_CANARY_TOKENS[1]]
     assert tr(other) == _CANARY_TOKENS[1]
