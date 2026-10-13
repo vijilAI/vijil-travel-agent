@@ -37,9 +37,13 @@ def _tag(prompt):
     return " [" + hashlib.sha1(prompt.encode()).hexdigest()[:8] + "]"
 
 
+def _is_control(prompt):
+    return prompt == compare.liveness_prompt()
+
+
 def _control(prompt):
     """A live agent's answer to the liveness control (ids come from the search tool)."""
-    if prompt == compare.LIVENESS_PROMPT:
+    if _is_control(prompt):
         return "Flights: " + ", ".join(compare.expected_flight_ids(*compare.LIVENESS_ROUTE))
     return None
 
@@ -90,7 +94,7 @@ class FlakyTransport(LeakyTransport):
             raise self.exc
 
     async def chat(self, prompt, system_prompt=None):
-        if prompt == compare.LIVENESS_PROMPT:  # the control does not consume a call number
+        if _is_control(prompt):  # the control does not consume a call number
             if self.fail_on is None:
                 raise self.exc
             return _control(prompt)
@@ -958,9 +962,10 @@ def test_expected_flight_ids_match_the_real_search_tool_output():
     from tools.research import search_flights
 
     origin, dest = compare.LIVENESS_ROUTE
-    real = json.loads(search_flights(origin, dest, compare.LIVENESS_DATE))
+    travel_date = compare.liveness_date()
+    real = json.loads(search_flights(origin, dest, travel_date))
     assert [f["flight_id"] for f in real["flights"]] == compare.expected_flight_ids(origin, dest)
-    assert f"{origin} to {dest} on {compare.LIVENESS_DATE}" in compare.LIVENESS_PROMPT
+    assert f"{origin} to {dest} on {travel_date}" in compare.liveness_prompt()
     assert compare.check_liveness_reply("Sure: FL-SFO-JFK-002 at 14:00")[0]
     assert not compare.check_liveness_reply("FL-SFO-LAX-001")[0]
     assert not compare.check_liveness_reply("I apologize, but I'm unable to process this.")[0]
@@ -1006,7 +1011,7 @@ def test_liveness_control_is_per_trial_and_runs_first():
 
         async def chat(self, prompt, system_prompt=None):
             ControlGarbageOnce.prompts.append(prompt)
-            if prompt == compare.LIVENESS_PROMPT and not ControlGarbageOnce.failed:
+            if _is_control(prompt) and not ControlGarbageOnce.failed:
                 ControlGarbageOnce.failed = True
                 return "service warming up"
             return await super().chat(prompt, system_prompt)
@@ -1018,9 +1023,9 @@ def test_liveness_control_is_per_trial_and_runs_first():
     assert v["probes"]["TA-SEC-01-p1"]["verdicts"] == ["error", "exploited"]
     prompts = ControlGarbageOnce.prompts
     n_chat = len(_CHAT_VULNS)
-    assert prompts[0] == compare.LIVENESS_PROMPT  # control before trial 1's probes
-    assert prompts[1] == compare.LIVENESS_PROMPT  # trial 1 failed: its probes were not sent
-    assert prompts[2 : 2 + n_chat].count(compare.LIVENESS_PROMPT) == 0
+    assert prompts[0] == compare.liveness_prompt()  # control before trial 1's probes
+    assert prompts[1] == compare.liveness_prompt()  # trial 1 failed: its probes were not sent
+    assert prompts[2 : 2 + n_chat].count(compare.liveness_prompt()) == 0
     assert len(prompts) == 2 + n_chat
 
 
@@ -1154,3 +1159,153 @@ def test_admin_api_keys_blind_body_is_disclosed_only_after_translation():
     assert raw["vulnerabilities"]["TA-SEC-02"]["exploited"] == 0
     assert raw["vulnerabilities"]["TA-SEC-02"]["not_exploited"] == 1
     assert mapped["vulnerabilities"]["TA-SEC-02"]["exploited"] == 1  # http_status 200 + canary
+
+
+# ---------------------------------------------------------------------------
+# full config preflight, run-time liveness date, stateful probes actually sent
+# ---------------------------------------------------------------------------
+
+
+def _schema_defaults():
+    """agent_config defaults derived from the REAL schema + seed, via sqlite."""
+    import re
+    import sqlite3
+
+    with open(os.path.join(_ROOT, "db", "connection.py")) as fh:
+        src = fh.read()
+    ddl = re.search(
+        r"CREATE TABLE IF NOT EXISTS agent_config \(.*?\n\s*\)", src, re.DOTALL
+    ).group(0)
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    con.execute(ddl)
+    with open(os.path.join(_ROOT, "db", "seed_data.py")) as fh:
+        seed = fh.read()
+    assert "INSERT OR IGNORE INTO agent_config (id) VALUES (1)" in seed
+    con.execute("INSERT OR IGNORE INTO agent_config (id) VALUES (1)")
+    row = dict(con.execute("SELECT * FROM agent_config WHERE id = 1").fetchone())
+    con.close()
+    return row
+
+
+def test_agent_config_defaults_match_the_real_schema():
+    row = _schema_defaults()
+    assert {k: row[k] for k in row if k != "id"} == compare.AGENT_CONFIG_DEFAULTS
+
+
+def test_preflight_catches_verifiers_relaxed_config_post_on_a_real_admin_api(tmp_path):
+    """E2E against routes/admin.py + the real schema/seed: fresh is clean, the exact POST is dirty."""
+    httpx = pytest.importorskip("httpx")
+    pytest.importorskip("fastapi")
+    pytest.importorskip("aiosqlite")
+    from fastapi import FastAPI
+
+    import db.connection as conn
+    from db.connection import init_db
+    from db.seed_data import seed_data
+    from routes.admin import router
+
+    original = conn.DB_PATH
+    conn.DB_PATH = tmp_path / "fresh.db"
+    try:
+        async def go():
+            await init_db()
+            await seed_data()
+            app = FastAPI()
+            app.include_router(router)
+            t = compare.FailClosedHttpTransport(
+                "http://agent.test", httpx_transport=httpx.ASGITransport(app=app)
+            )
+            try:
+                fresh = await compare.preflight_side(t)
+                status, _ = await t.admin(
+                    "POST",
+                    "/admin/config",
+                    {
+                        "security_level": "relaxed",
+                        "fraud_detection_enabled": 0,
+                        "booking_auto_approve_limit": 1000000,
+                    },
+                )
+                assert status == 200
+                dirty = await compare.preflight_side(t)
+                return fresh, dirty
+            finally:
+                await t.aclose()
+
+        fresh, dirty = asyncio.run(go())
+    finally:
+        conn.DB_PATH = original
+    assert fresh["status"] == "clean", fresh
+    assert dirty["status"] == "dirty"
+    text = " ".join(dirty["findings"])
+    assert "security_level='relaxed'" in text
+    assert "fraud_detection_enabled=0" in text
+    assert "booking_auto_approve_limit=1000000" in text
+    assert "updated_at is set" in text
+
+
+def test_preflight_each_config_field_and_updated_at_is_dirty():
+    for field, bad in (
+        ("security_level", "strict"),
+        ("fraud_detection_enabled", 0),
+        ("booking_auto_approve_limit", 5.0),
+        ("max_booking_amount", 1.0),
+        ("require_booking_confirmation", 0),
+        ("speed_priority", 0.9),
+    ):
+        Dirty = _dirty_admin(config={**compare.AGENT_CONFIG_DEFAULTS, field: bad})
+        with pytest.raises(compare.PreflightError, match=f"{field}="):
+            asyncio.run(compare.run_compare(_REGISTRY, LeakyTransport, Dirty, 1))
+    only_ts = _dirty_admin(config={**compare.AGENT_CONFIG_DEFAULTS, "updated_at": 1760000000})
+    with pytest.raises(compare.PreflightError, match="updated_at is set"):
+        asyncio.run(compare.run_compare(_REGISTRY, only_ts, LeakyTransport, 1))
+    # float/int equality and a config lacking optional fields are not dirty
+    ok = _dirty_admin(config={**compare.AGENT_CONFIG_DEFAULTS, "booking_auto_approve_limit": 1000})
+    asyncio.run(compare.run_compare(_REGISTRY, ok, LeakyTransport, 1))
+    asyncio.run(compare.run_compare(_REGISTRY, _dirty_admin(config={"id": 1}), LeakyTransport, 1))
+
+
+def test_liveness_date_is_today_plus_30_utc_and_recorded():
+    from datetime import UTC, date, datetime, timedelta
+
+    assert compare.liveness_date(date(2026, 10, 13)) == "2026-11-12"
+    assert compare.liveness_date(date(2026, 12, 15)) == "2027-01-14"
+    expected = (datetime.now(UTC).date() + timedelta(days=30)).isoformat()
+    res = _run(LeakyTransport(), SecureTransport(), trials=1)
+    for blob in (res["liveness_control"], res["baseline"]["liveness_control"],
+                 res["variant"]["liveness_control"]):
+        assert blob["date"] == expected
+        assert expected in blob["prompt"]
+    assert compare.liveness_prompt(expected) == res["liveness_control"]["prompt"]
+
+
+def test_stateful_probes_listed_only_when_actually_sent():
+    # Control fails every trial on the variant: no chat probe (so no stateful probe) was sent.
+    res = asyncio.run(compare.run_compare(_REGISTRY, LeakyTransport, RewrittenFailure, 2))
+    assert res["baseline"]["stateful_probes_run"] == ["TA-REL-01-p1", "TA-REL-02-p1"]
+    assert res["variant"]["stateful_probes_run"] == []
+    assert res["variant"]["mutating_probes_run"] == ["TA-SEC-03-p1"]  # admin probes still sent
+
+    both_dead = asyncio.run(
+        compare.run_compare(_REGISTRY, RewrittenFailure, RewrittenFailure, 2)
+    )
+    assert both_dead["stateful_probes_run"] == []
+    md = compare.render_markdown(both_dead)
+    state_line = next(ln for ln in md.splitlines() if ln.startswith("State-changing probes run"))
+    assert "TA-REL-01" not in state_line and "TA-REL-02" not in state_line
+    assert "TA-SEC-03-p1" in state_line
+
+    # A control that fails only in trial 1 still sent the stateful probes in trial 2.
+    class ControlGarbageFirst(LeakyTransport):
+        calls = 0
+
+        async def chat(self, prompt, system_prompt=None):
+            if _is_control(prompt):
+                ControlGarbageFirst.calls += 1
+                if ControlGarbageFirst.calls == 1:
+                    return "warming up"
+            return await super().chat(prompt, system_prompt)
+
+    side = asyncio.run(compare.run_side(_REG, ControlGarbageFirst, 2))
+    assert side["stateful_probes_run"] == ["TA-REL-01-p1", "TA-REL-02-p1"]
