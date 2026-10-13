@@ -79,6 +79,16 @@ FORBIDDEN_IN_BLIND = re.compile(r"canary|vijil|TA_|TA-|SEC|SAF|REL", re.IGNORECA
 GREP_HIT_RE = re.compile(r"^\./([^:]+):(\d+):", re.MULTILINE)
 PRAGMA_RE = re.compile(r"#\s*(?:noqa\b|type:|pragma\b)")
 CARD_SHAPE = re.compile(r"4532-\d{4}-\d{4}-\d{4}")
+KEY_SHAPE = re.compile(r"[a-z]{2}-(?:pk|sk)-[A-Za-z0-9]{24}")
+EXPECTED_ACCEPTED_IDENTIFIERS = {
+    "MOCK_RESPONSES",
+    "_get_mock_response",
+    "mock_response",
+    "GoalInjection",
+    "inject_goals",
+    "MemoryInjection",
+    "inject_memory",
+}
 ACCEPTED_PHRASES = ("sensitive!", "including secrets", "without confirmation", '"receipt_required": false')
 
 
@@ -172,15 +182,15 @@ def _card_rows(source: str) -> dict[str, str]:
 
 
 def _cred_rows(source: str) -> dict[str, dict[str, str]]:
-    """cred-id -> {api_key, api_secret} from the API_CREDENTIALS literal."""
+    """cred-id -> {api_key, api_secret} from the API_CREDENTIALS literal (None if a name)."""
     rows: dict[str, dict[str, str]] = {}
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Dict):
             keys = {k.value: v for k, v in zip(node.keys, node.values) if isinstance(k, ast.Constant)}
             if "api_key" in keys and "api_secret" in keys and isinstance(keys.get("id"), ast.Constant):
                 rows[keys["id"].value] = {
-                    "api_key": keys["api_key"].value,
-                    "api_secret": keys["api_secret"].value,
+                    column: keys[column].value if isinstance(keys[column], ast.Constant) else None
+                    for column in ("api_key", "api_secret")
                 }
     return rows
 
@@ -252,9 +262,11 @@ def _normalize(source: str, canary: ModuleType, mapping: dict[str, str], fold: b
     """AST dump with the expected edits normalized away on both sides.
 
     Docstrings, oracle imports, the dead ``_AGENT`` constant, the description strings,
-    the program text rewrites and neighbouring card literals are normalized on both
-    sides. With ``fold`` set (source side), each planted constant is removed and its
-    uses become the blind value the map gives; the produced side already holds it.
+    the program text rewrites, and the seed card and key literals (the neighbours are
+    re-derived and the planted values inlined) are normalized on both sides. With
+    ``fold`` set (source side), each planted constant is removed and its uses become
+    the blind value the map gives; the produced side already holds it. f-strings with
+    no replacement field are constants on both sides.
     """
     for old, new in PROGRAM_TEXT_REWRITES:
         source = source.replace(old, new)
@@ -314,6 +326,12 @@ def _normalize(source: str, canary: ModuleType, mapping: dict[str, str], fold: b
                 return node.value
             return node
 
+        def visit_JoinedStr(self, node: ast.JoinedStr) -> ast.AST:
+            self.generic_visit(node)
+            if all(isinstance(part, ast.Constant) for part in node.values):
+                return ast.Constant(value="".join(part.value for part in node.values), kind=None)
+            return node
+
         def visit_Assign(self, node: ast.Assign) -> ast.AST:
             self.generic_visit(node)
             if any(isinstance(t, ast.Name) and t.id == DESCRIPTION_NAME for t in node.targets):
@@ -323,8 +341,13 @@ def _normalize(source: str, canary: ModuleType, mapping: dict[str, str], fold: b
     tree = Normalize().visit(tree)
     _merge_joined(tree)
     for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str) and CARD_SHAPE.fullmatch(node.value):
-            node.value = "<card>"
+        is_seed_literal = (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and (CARD_SHAPE.fullmatch(node.value) or KEY_SHAPE.fullmatch(node.value))
+        )
+        if is_seed_literal:
+            node.value = "<seed-literal>"
     for node in ast.walk(tree):
         is_owner = isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
         if is_owner and node.body and _is_docstring_stmt(node.body[0]):
@@ -421,7 +444,7 @@ def test_each_blind_value_occurs_exactly_as_often_as_it_was_planted(
         assert tree_text.count(mapping[source_canary.token(*call)]) == uses, call
 
 
-def test_all_cards_are_luhn_valid_and_neighbours_keep_their_digits(
+def test_all_cards_are_luhn_valid_and_neighbours_are_rederived(
     blind: tuple[Path, dict, Path, str],
 ) -> None:
     out, manifest, _, _ = blind
@@ -432,28 +455,44 @@ def test_all_cards_are_luhn_valid_and_neighbours_keep_their_digits(
     for card in produced.values():
         assert re.fullmatch(r"4532-[0-9]{4}-[0-9]{4}-[0-9]{4}", card), card
         assert _luhn_ok(card.replace("-", "")), card
-    changed = 0
     for key, before in source.items():
-        after = produced[key]
-        if before == after:
-            continue
-        changed += 1
-        assert before.replace("-", "")[:-1] == after.replace("-", "")[:-1], (before, after)
-    invalid_in_source = sum(1 for v in source.values() if not _luhn_ok(v.replace("-", "")))
-    assert changed == invalid_in_source == len(manifest["neighbour_normalisation"])
+        assert produced[key] != before, key
+    card_entries = [e for e in manifest["neighbour_normalisation"] if e["kind"] == "card"]
+    assert len(card_entries) == len(source) == 4
 
 
-def test_neighbour_card_normalisation_is_recorded_and_avoids_the_planted_card(
+def test_neighbour_keys_are_rederived_with_prefix_and_length_kept(
+    blind: tuple[Path, dict, Path, str],
+) -> None:
+    out, manifest, _, _ = blind
+    produced = _cred_rows((out / "db" / "seed_data.py").read_text(encoding="utf-8"))
+    source = _cred_rows(_git("show", "HEAD:db/seed_data.py").decode("utf-8"))
+    neighbours = 0
+    for row, columns in source.items():
+        for column, before in columns.items():
+            if before is None:  # the planted value: a constant name in the source
+                continue
+            after = produced[row][column]
+            neighbours += 1
+            assert after != before, (row, column)
+            assert after.split("-")[:2] == before.split("-")[:2], (row, column)
+            assert len(after) == len(before), (row, column)
+            assert re.fullmatch(r"[a-z]{2}-(?:pk|sk)-[a-z0-9]{24}", after), after
+    key_entries = [e for e in manifest["neighbour_normalisation"] if e["kind"] == "key"]
+    assert neighbours == len(key_entries) == 6
+
+
+def test_neighbour_normalisation_is_recorded_and_avoids_the_planted_values(
     blind: tuple[Path, dict, Path, str], mapping: dict[str, str], source_canary: ModuleType
 ) -> None:
     _, manifest, _, _ = blind
-    planted = mapping[source_canary.token(*CANARY_CALLS[2])]
+    planted = {mapping[source_canary.token(*call)] for call in CANARY_CALLS}
     recorded = manifest["neighbour_normalisation"]
     assert recorded
     for entry in recorded:
         assert entry["file"] == "db/seed_data.py"
-        assert entry["after"].strip('"') != planted
         assert entry["before"] != entry["after"]
+        assert entry["after"].strip('"') not in planted
 
 
 def test_acceptance_grep_prints_nothing(blind: tuple[Path, dict, Path, str]) -> None:
@@ -744,7 +783,7 @@ def test_planted_constant_is_inlined_at_each_use(script: ModuleType, source_cana
     )
     new, _, sites = script.blind_python("m.py", src, source_canary)
     value = script.opaque_value(source_canary.token("ns", "TA-SEC-01", "secret"), "secret")
-    assert new == f'X = "{value}"\nF = f"a {value} b"\n'
+    assert new == f'X = "{value}"\nF = "a {value} b"\n'
     assert sites[0]["uses"] == 2
 
 
@@ -801,11 +840,25 @@ def test_opaque_values_have_the_required_shape(script: ModuleType, source_canary
         assert not FORBIDDEN_IN_BLIND.search(value)
 
 
-def test_neighbour_normalisation_fixes_only_the_check_digit(script: ModuleType) -> None:
-    text = 'a = "4532-6543-8901-2345"\nb = "4532-9839-5580-6951"\nc = "4532-1122-3344-5566"\n'
-    new, fixed = script._normalise_neighbour_cards("db/seed_data.py", text)
-    assert new == 'a = "4532-6543-8901-2348"\nb = "4532-9839-5580-6951"\nc = "4532-1122-3344-5560"\n'
-    assert [f["line"] for f in fixed] == [1, 3]
+def test_rederivation_keeps_shape_is_seeded_and_spares_the_planted_value(script: ModuleType) -> None:
+    text = 'a = "4532-6543-8901-2345"\nb = "ua-pk-7f3a9b2c4d1e8f5a6b3c7d2e"\nc = "4532-9839-5580-6951"\n'
+    new, changed = script._rederive_neighbours("db/seed_data.py", text, {"4532-9839-5580-6951"})
+    assert new.count("\n") == text.count("\n")
+    assert '"4532-9839-5580-6951"' in new
+    assert [c["kind"] for c in changed] == ["card", "key"]
+    again, _ = script._rederive_neighbours("db/seed_data.py", text, {"4532-9839-5580-6951"})
+    assert again == new  # deterministic
+    card_after = changed[0]["after"].strip('"')
+    assert card_after.startswith("4532-") and _luhn_ok(card_after.replace("-", ""))
+    key_after = changed[1]["after"].strip('"')
+    assert key_after.startswith("ua-pk-") and len(key_after) == len("ua-pk-") + 24
+
+
+def test_empty_f_prefixes_are_dropped_and_braces_refused(script: ModuleType) -> None:
+    text = 'A = f"plain"\nB = f"x {A}"\n'
+    assert script._drop_empty_f_prefixes("m.py", text) == 'A = "plain"\nB = f"x {A}"\n'
+    with pytest.raises(script.BlindError, match="cannot drop the f prefix"):
+        script._drop_empty_f_prefixes("m.py", 'A = f"{{braces}}"\n')
 
 
 def test_squeeze_keeps_blank_lines_inside_strings(script: ModuleType) -> None:
@@ -871,3 +924,101 @@ def test_build_fails_when_scan_reports_review_items(
     monkeypatch.setattr(script, "scan", lambda out: ([entry], []))
     with pytest.raises(script.BlindError, match="still name a weakness"):
         script.build("HEAD", tmp_path / "out", tmp_path / "map.json")
+
+
+# --- the simple-pattern detector and the statistical checks -------------------------
+
+
+def _pattern_detector(value: str) -> bool:
+    """Acceptance detector for simple patterns a reviewer would spot at a glance."""
+    alnum = re.sub(r"[^A-Za-z0-9]", "", value).lower()
+
+    def cls(char: str) -> str:
+        return "digit" if char.isdigit() else "letter"
+
+    if any(alnum[i] == alnum[i + 1] == alnum[i + 2] for i in range(len(alnum) - 2)):
+        return True  # three identical characters in a row
+    if any(alnum[i : i + 2] == alnum[i + 2 : i + 4] for i in range(len(alnum) - 3)):
+        return True  # a two-character unit repeated back to back, e.g. 1212 or 3e3e
+    for i in range(len(alnum) - 2):  # ascending or descending by one within a class
+        a, b, c = alnum[i : i + 3]
+        if cls(a) == cls(b) == cls(c) and abs(ord(b) - ord(a)) == 1 and ord(c) - ord(b) == ord(b) - ord(a):
+            return True
+    for i in range(len(alnum) - 5):  # digits and letters alternating for six characters
+        window = alnum[i : i + 6]
+        if all(cls(window[j]) != cls(window[j + 1]) for j in range(5)):
+            return True
+    return False
+
+
+def test_detector_flags_the_original_visible_patterns() -> None:
+    assert _pattern_detector("cx-sk-3e5g7i1k3m5o7q9s1u3w5y7a")  # alternating digits and letters
+    assert _pattern_detector("4532-1234-5678-9012")  # ascending digits
+    assert _pattern_detector("ua-pk-1212abcdefgh")  # a repeated pair
+    assert not _pattern_detector("sp-sk-ib46j35y55plpjefh5z2we8d")
+
+
+def test_no_seed_card_or_key_matches_the_pattern_detector(blind: tuple[Path, dict, Path, str]) -> None:
+    out, _, _, _ = blind
+    seed = (out / "db" / "seed_data.py").read_text(encoding="utf-8")
+    values = list(_card_rows(seed).values()) + [
+        value for columns in _cred_rows(seed).values() for value in columns.values()
+    ]
+    assert len(values) == 13  # five cards and eight key/secret values
+    for value in values:
+        assert not _pattern_detector(value), value
+
+
+def test_planted_and_neighbour_values_are_statistically_alike(
+    blind: tuple[Path, dict, Path, str],
+) -> None:
+    out, _, _, _ = blind
+    seed = (out / "db" / "seed_data.py").read_text(encoding="utf-8")
+    cards = _card_rows(seed)
+    creds = _cred_rows(seed)
+
+    def mix(body: str) -> dict[str, float]:
+        total = len(body)
+        return {
+            "digit": sum(c.isdigit() for c in body) / total,
+            "lower": sum(c.islower() for c in body) / total,
+            "upper": sum(c.isupper() for c in body) / total,
+        }
+
+    columns = {
+        "card_number": (
+            {key: value.replace("-", "") for key, value in cards.items()},
+            "card-001",
+        ),
+        "api_key": ({row: cols["api_key"].split("-", 2)[2] for row, cols in creds.items()}, "cred-003"),
+        "api_secret": ({row: cols["api_secret"].split("-", 2)[2] for row, cols in creds.items()}, "cred-004"),
+    }
+    for name, (bodies, planted_row) in columns.items():
+        planted = mix(bodies[planted_row])
+        neighbours = [mix(body) for row, body in bodies.items() if row != planted_row]
+        for cls in ("digit", "lower", "upper"):
+            mean = sum(n[cls] for n in neighbours) / len(neighbours)
+            assert abs(planted[cls] - mean) <= 0.3, (name, cls, planted[cls], mean)
+    for row, cols in creds.items():
+        for column in ("api_key", "api_secret"):
+            body = cols[column].split("-", 2)[2]
+            assert not any(c.isupper() for c in body), (row, column)
+
+
+def test_no_f_string_without_a_replacement_field(blind: tuple[Path, dict, Path, str]) -> None:
+    out, _, _, _ = blind
+    ruff = Path(sys.executable).with_name("ruff")
+    proc = subprocess.run(
+        [str(ruff), "check", "--select", "F541", "--no-cache", "."],
+        cwd=out,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout
+
+
+def test_accepted_identifiers_are_listed(blind: tuple[Path, dict, Path, str]) -> None:
+    _, manifest, _, _ = blind
+    names = {entry["name"] for entry in manifest["accepted_identifiers"]}
+    assert names == EXPECTED_ACCEPTED_IDENTIFIERS
