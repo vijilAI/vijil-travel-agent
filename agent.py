@@ -18,13 +18,18 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import asyncio
+import contextlib
 import logging
+import math
 import os
 import sqlite3
+import threading
 import time
 import tomllib
+from collections.abc import AsyncGenerator, AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING, cast
 from uuid import uuid4
 
 from pydantic import BaseModel
@@ -90,6 +95,116 @@ DOME_ENABLED = os.environ.get("DOME_ENABLED", "0") == "1"
 # The system prompt text lives in system_prompt.py so it can be changed on its own.
 from system_prompt import DEFAULT_SYSTEM_PROMPT, render_system_prompt
 
+# Model: served by Groq's OpenAI-compatible endpoint. TRAVEL_AGENT_MODEL overrides
+# the model id (read per agent, so a restart is not needed to pick it up).
+DEFAULT_MODEL_ID = "openai/gpt-oss-120b"
+MODEL_BASE_URL = "https://api.groq.com/openai/v1"
+# Per model call; a reasoning model spends part of this on reasoning tokens.
+MODEL_MAX_TOKENS = 4096
+
+# Run bounds: every agent run (chat completions, AgentCore /invocations, A2A) stops
+# after TRAVEL_AGENT_MAX_TURNS model turns or TRAVEL_AGENT_TURN_TIMEOUT_S seconds,
+# whichever comes first, and raises. /invocations answers 502 and an A2A task ends
+# "failed"; /v1/chat/completions keeps its generic error text (ERROR_MESSAGE).
+DEFAULT_MAX_TURNS = 8
+DEFAULT_TURN_TIMEOUT_S = 90.0
+# The timeout cancels the run cooperatively (strands checks between model chunks
+# and tools). A tool that blocks past that point is abandoned this much later.
+HARD_STOP_GRACE_S = 5.0
+
+
+def agent_model_id() -> str:
+    """Model id for new agents: TRAVEL_AGENT_MODEL, else DEFAULT_MODEL_ID."""
+    return os.environ.get("TRAVEL_AGENT_MODEL") or DEFAULT_MODEL_ID
+
+
+@dataclass(frozen=True)
+class RunBounds:
+    """Per-run caps: model turns and wall-clock seconds."""
+
+    max_turns: int
+    timeout_s: float
+
+
+def _positive_env(name: str, default: float, parse: Callable[[str], float]) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = parse(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive number, got {raw!r}") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive number, got {raw!r}")
+    return value
+
+
+def run_bounds_from_env() -> RunBounds:
+    """Run bounds from TRAVEL_AGENT_MAX_TURNS / TRAVEL_AGENT_TURN_TIMEOUT_S.
+
+    Raises ValueError on a non-positive or unparseable value, so a bad setting
+    fails every request loudly instead of silently running unbounded.
+    """
+    return RunBounds(
+        max_turns=int(_positive_env("TRAVEL_AGENT_MAX_TURNS", DEFAULT_MAX_TURNS, int)),
+        timeout_s=_positive_env("TRAVEL_AGENT_TURN_TIMEOUT_S", DEFAULT_TURN_TIMEOUT_S, float),
+    )
+
+
+class AgentRunBoundExceeded(RuntimeError):
+    """An agent run hit its turn cap or wall-clock bound; it produced no answer."""
+
+
+class BoundedAgent(Agent):
+    """A Strands Agent whose every invocation is bounded by ``RunBounds``.
+
+    All entry points (``__call__``, ``invoke_async``, and the ``stream_async`` the
+    A2A executor uses) go through ``stream_async``, so the bounds are applied there:
+    strands' ``limits={"turns": N}`` caps the loop, and a timer sets the run's
+    ``cancel_signal`` at the deadline. Strands reports both as a normal result
+    (stop_reason ``limit_turns`` / ``cancelled``); this class raises instead, so a
+    truncated run can never be returned as an answer.
+    """
+
+    def __init__(self, *args: Any, bounds: RunBounds, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.bounds = bounds
+
+    async def stream_async(self, prompt: Any = None, **kwargs: Any) -> AsyncIterator[Any]:
+        # invoke_async forwards both as None; only caller-supplied values are refused.
+        if kwargs.pop("cancel_signal", None) is not None or kwargs.pop("limits", None) is not None:
+            raise TypeError("BoundedAgent owns cancel_signal and limits; call cancel() instead")
+        deadline = threading.Event()
+        timer = asyncio.get_running_loop().call_later(self.bounds.timeout_s, deadline.set)
+        # strands annotates stream_async as AsyncIterator; it is an async generator.
+        events = cast(
+            AsyncGenerator[Any, None],
+            super().stream_async(
+                prompt, limits={"turns": self.bounds.max_turns}, cancel_signal=deadline, **kwargs
+            ),
+        )
+        try:
+            # aclosing: when we raise, strands' generator is closed now, not by the GC.
+            async with contextlib.aclosing(events):
+                async for event in events:
+                    if "result" in event:
+                        self._raise_if_cut_short(event["result"].stop_reason, deadline.is_set())
+                    yield event
+        finally:
+            timer.cancel()
+
+    def _raise_if_cut_short(self, stop_reason: str, deadline_passed: bool) -> None:
+        if stop_reason == "limit_turns":
+            raise AgentRunBoundExceeded(
+                f"agent run hit the {self.bounds.max_turns}-turn cap (TRAVEL_AGENT_MAX_TURNS)"
+            )
+        if stop_reason == "cancelled":
+            if deadline_passed:
+                raise AgentRunBoundExceeded(
+                    f"agent run exceeded {self.bounds.timeout_s:g}s (TRAVEL_AGENT_TURN_TIMEOUT_S)"
+                )
+            raise AgentRunBoundExceeded("agent run was cancelled before it answered")
+
 # Agent identity for Darwin telemetry (only meaningful with Dome)
 AGENT_ID = os.environ.get("VIJIL_AGENT_ID", "")
 
@@ -107,7 +222,7 @@ Compare trust scores between this agent and the unprotected vijil-travel-agent
 to see Dome's impact on security, safety, and reliability.
 
 Capabilities: Flight search, booking, payments, loyalty points, expense management.
-Model: Groq llama-3.1-8b-instant
+Model: Groq openai/gpt-oss-120b
 Protocol: A2A (Agent-to-Agent)
 Protection: Vijil Dome (active)"""
 else:
@@ -124,7 +239,7 @@ employee directory, corporate cards, API credentials, persistent memory,
 email, partner API calls, webhook registration.
 
 Admin API: /admin/* (unauthenticated — intentional vulnerability)
-Model: Groq llama-3.1-8b-instant
+Model: Groq openai/gpt-oss-120b
 Protocol: A2A (Agent-to-Agent)
 
 WARNING: This agent contains intentionally seeded vulnerabilities for security testing.
@@ -435,7 +550,7 @@ class ConcurrentA2AExecutor(AgentExecutor):
     executor creates a new agent for each request, enabling full concurrency.
     """
 
-    def __init__(self, agent_factory: Callable[[], Agent]):
+    def __init__(self, agent_factory: Callable[[], BoundedAgent]):
         self.agent_factory = agent_factory
 
     ERROR_MESSAGE = (
@@ -455,8 +570,7 @@ class ConcurrentA2AExecutor(AgentExecutor):
         logger.debug(f"Created fresh agent for request: {id(agent)}")
 
         try:
-            executor = StrandsA2AExecutor(agent)
-            await executor.execute(context, event_queue)
+            await self._run_with_hard_stop(agent, context, event_queue)
         except Exception as e:
             logger.warning(f"Agent execution failed: {type(e).__name__}: {e}")
 
@@ -480,6 +594,67 @@ class ConcurrentA2AExecutor(AgentExecutor):
             await event_queue.enqueue_event(status_event)
             await event_queue.close()
 
+    async def _run_with_hard_stop(
+        self, agent: "BoundedAgent", context: RequestContext, event_queue: EventQueue,
+    ) -> None:
+        """Run the Strands executor; fail the task if it outlives the hard stop.
+
+        BoundedAgent ends a runaway run itself (the task then fails with "Agent
+        execution failed"). The hard stop is for a tool that ignores cancellation.
+        """
+        run = asyncio.create_task(StrandsA2AExecutor(agent).execute(context, event_queue))
+        hard_stop_s = agent.bounds.timeout_s + HARD_STOP_GRACE_S
+        try:
+            done, _ = await asyncio.wait({run}, timeout=hard_stop_s)
+            if done:
+                run.result()
+                return
+            await self._fail_abandoned_run(context, event_queue, hard_stop_s)
+        finally:
+            # Also reached when this request is cancelled (client gone, shutdown):
+            # the run must not keep calling tools after its caller left.
+            if not run.done():
+                agent.cancel()
+                run.cancel()
+
+    @staticmethod
+    async def _fail_abandoned_run(
+        context: RequestContext, event_queue: EventQueue, hard_stop_s: float,
+    ) -> None:
+        """End the task as failed, then close the queue so the cancelled run's own
+        "canceled" update is dropped instead of replacing this one."""
+        from a2a.types import (
+            Message,
+            Part,
+            Role,
+            TaskState,
+            TaskStatus,
+            TaskStatusUpdateEvent,
+            TextPart,
+        )
+
+        text = f"Agent run abandoned after {hard_stop_s:g}s (TRAVEL_AGENT_TURN_TIMEOUT_S + grace)"
+        logger.warning(text)
+        await event_queue.enqueue_event(
+            TaskStatusUpdateEvent(
+                kind="status-update",
+                task_id=context.task_id or "",
+                context_id=context.context_id or "",
+                final=True,
+                status=TaskStatus(
+                    state=TaskState.failed,
+                    message=Message(
+                        message_id=str(uuid4()),
+                        role=Role.agent,
+                        parts=[Part(root=TextPart(kind="text", text=text))],
+                        task_id=context.task_id or "",
+                        context_id=context.context_id or "",
+                    ),
+                ),
+            )
+        )
+        await event_queue.close()
+
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         agent = self.agent_factory()
         executor = StrandsA2AExecutor(agent)
@@ -494,7 +669,7 @@ class ConcurrentA2AExecutor(AgentExecutor):
 _dome_hooks: list | None = None
 
 
-def create_agent(messages=None) -> Agent:
+def create_agent(messages=None) -> BoundedAgent:
     """Create a fresh travel agent with all tools.
 
     System prompt is loaded dynamically from genome file (if GENOME_PATH set),
@@ -534,16 +709,17 @@ def create_agent(messages=None) -> Agent:
         config=config, memories=instruction_memories, genome=genome,
     )
 
-    return Agent(
+    return BoundedAgent(
+        bounds=run_bounds_from_env(),
         name=AGENT_NAME,
         description=AGENT_DESCRIPTION,
         model=OpenAIModel(
-            model_id="llama-3.1-8b-instant",
+            model_id=agent_model_id(),
             client_args={
-                "base_url": "https://api.groq.com/openai/v1",
+                "base_url": MODEL_BASE_URL,
                 "api_key": os.environ.get("GROQ_API_KEY"),
             },
-            params={"max_tokens": 4096},
+            params={"max_tokens": MODEL_MAX_TOKENS},
         ),
         tools=[
             search_flights,
@@ -572,7 +748,7 @@ def create_agent(messages=None) -> Agent:
 
 
 def create_concurrent_a2a_app(
-    agent_factory: Callable[[], Agent],
+    agent_factory: Callable[[], BoundedAgent],
     host: str = "0.0.0.0",
     port: int = 9000,
 ) -> Any:
@@ -611,7 +787,7 @@ def create_concurrent_a2a_app(
 # OpenAI-Compatible Chat Completions Endpoint
 # =============================================================================
 
-def _chat_response(content: str, model: str = "llama-3.1-8b-instant") -> JSONResponse:
+def _chat_response(content: str, model: str = DEFAULT_MODEL_ID) -> JSONResponse:
     """Build an OpenAI-compatible chat completion response."""
     return JSONResponse(content={
         "id": f"chatcmpl-{uuid4().hex[:24]}",
@@ -676,11 +852,20 @@ async def run_chat_completion(
     # Everything before the last user message is conversation history
     history = _openai_to_strands_messages(messages[:last_user_idx])
 
-    # Run Strands agent in thread pool (Dome hooks guard input/output inside Agent)
+    # Run Strands agent in thread pool (Dome hooks guard input/output inside Agent).
+    # create_agent returns a BoundedAgent, which raises AgentRunBoundExceeded on its
+    # turn cap or deadline. The wait below is the hard stop for a tool that blocks past it.
     try:
+        bounds = run_bounds_from_env()
         agent = create_agent(messages=history if history else None)
-        result = await asyncio.to_thread(agent, user_text)
-        return str(result)
+        run = asyncio.ensure_future(asyncio.to_thread(agent, user_text))
+        done, _ = await asyncio.wait({run}, timeout=bounds.timeout_s + HARD_STOP_GRACE_S)
+        if not done:
+            agent.cancel()
+            raise AgentRunBoundExceeded(
+                f"agent run abandoned after {bounds.timeout_s + HARD_STOP_GRACE_S:g}s"
+            )
+        return str(run.result())
     except Exception as e:
         logger.warning(f"Agent execution failed in chat completions: {e}")
         if raise_on_failure:
@@ -702,7 +887,7 @@ def add_chat_completions_endpoint(app: Any) -> None:
     """
 
     class ChatCompletionRequest(BaseModel):
-        model: str = "llama-3.1-8b-instant"
+        model: str = DEFAULT_MODEL_ID
         messages: list[ChatMessage]
         temperature: float = 1.0
         max_tokens: int | None = None

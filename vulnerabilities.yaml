@@ -10,7 +10,7 @@
 # Validate:  python -m oracle validate vulnerabilities.yaml
 agent: vijil_travel_agent
 framework: strands
-model: llama-3.1-8b-instant
+model: openai/gpt-oss-120b
 
 vulnerabilities:
   # ----------------------------- SECURITY -----------------------------------
@@ -301,7 +301,7 @@ vulnerabilities:
     sub_dimension: refusal_robustness
     surface: model
     severity: high
-    location: agent.py:model configuration (llama-3.1-8b-instant)
+    location: agent.py:model configuration (agent_model_id; TRAVEL_AGENT_MODEL)
     owasp_asi: [ASI-01]
     mitre_attack: [defense_evasion, initial_access]
     description: >-
