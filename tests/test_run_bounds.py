@@ -383,3 +383,60 @@ def test_a2a_request_cancellation_stops_the_run(monkeypatch):
 
     asyncio.run(cancel_mid_run())
     assert seen == {"agent_cancelled": True, "run_cancelled": True}
+
+
+# --- throttling: no model call after the run is cut off -----------------------
+
+class _ThrottledModel(_ScriptedModel):
+    """Every call is throttled (Groq 429); records when each call happened."""
+
+    def __init__(self) -> None:
+        super().__init__(loops=0)
+        self.call_times: list[float] = []
+
+    async def stream(self, messages, tool_specs=None, system_prompt=None, **kwargs) -> AsyncIterator[Any]:  # type: ignore[override]
+        from strands.types.exceptions import ModelThrottledException
+
+        self.calls += 1
+        self.call_times.append(time.monotonic())
+        raise ModelThrottledException("429 Too Many Requests")
+        yield  # pragma: no cover
+
+
+def test_no_model_retry_after_the_deadline(scripted, monkeypatch):
+    """A throttled run stops calling the model once it is cut off.
+
+    strands' default retry sleeps 4-64 s between attempts and ignores
+    cancellation, so the model was called again after the client had its 502.
+    """
+    monkeypatch.setenv("TRAVEL_AGENT_TURN_TIMEOUT_S", "0.5")
+    monkeypatch.setattr(agent_module, "HARD_STOP_GRACE_S", 0.3)
+    model = scripted(_ThrottledModel())
+
+    from strands.types.exceptions import ModelThrottledException
+
+    async def run_then_wait() -> float:
+        # Either failure is correct: the run is cut off, or the throttle surfaces
+        # because no retry is attempted after the deadline. Never an answer.
+        with pytest.raises((agent_module.AgentRunBoundExceeded, ModelThrottledException)):
+            await agent_module.run_chat_completion(
+                [agent_module.ChatMessage(role="user", content="go")], raise_on_failure=True
+            )
+        returned = time.monotonic()
+        await asyncio.sleep(3.0)  # longer than the 2 s first backoff
+        return returned
+
+    returned = asyncio.run(run_then_wait())
+    assert model.calls >= 1
+    assert all(t <= returned + 0.3 for t in model.call_times), (
+        f"model called after the request failed: {[round(t - returned, 2) for t in model.call_times]}"
+    )
+
+
+def test_bounded_agent_installs_the_cancellable_retry_strategy():
+    bounded = agent_module.BoundedAgent(
+        bounds=agent_module.run_bounds_from_env(),
+        model=_ScriptedModel(loops=0), callback_handler=None,
+    )
+    assert isinstance(bounded._retry, agent_module.CancellableRetryStrategy)
+    assert bounded._retry._max_attempts == 3
