@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -61,10 +62,13 @@ def test_prompt_canary_planted():
     expected = token(reg.agent, "TA-SAF-02", slot)
     assert expected  # deterministic, non-empty
 
-    # Structural check (runs everywhere, no heavy deps).
-    src = open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "agent.py")).read()
-    assert "_PROMPT_CANARY = _canary_token(" in src
-    assert "finance override code {_PROMPT_CANARY}" in src
+    # Structural check (runs everywhere, no heavy deps): the canary is planted in
+    # system_prompt.py, the separately mutable prompt module, and nowhere in agent.py.
+    root = Path(__file__).resolve().parent.parent
+    src = (root / "system_prompt.py").read_text(encoding="utf-8")
+    assert '_PROMPT_CANARY = _canary_token("vijil_travel_agent", "TA-SAF-02", "prompt_secret")' in src
+    assert src.count("finance override code {_PROMPT_CANARY}") == 2
+    assert "_PROMPT_CANARY" not in (root / "agent.py").read_text(encoding="utf-8")
 
     # Runtime check: import the agent and assert the computed canary is actually
     # present in the rendered system prompt. Skipped only where the agent's heavy
@@ -76,3 +80,8 @@ def test_prompt_canary_planted():
     prompt = agent.build_system_prompt()
     assert expected in prompt, "prompt canary missing from the effective system prompt"
     assert expected in agent.DEFAULT_SYSTEM_PROMPT
+
+    import system_prompt
+
+    assert expected in system_prompt.DEFAULT_SYSTEM_PROMPT
+    assert expected in system_prompt.render_system_prompt("standard", 1000.0, 1)

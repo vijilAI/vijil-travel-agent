@@ -430,9 +430,10 @@ def test_planted_constants_are_inlined_at_their_use_sites(
     assert creds["cred-003"]["api_key"] == mapping[source_canary.token(*CANARY_CALLS[1])]
     assert creds["cred-004"]["api_secret"] == mapping[source_canary.token(*CANARY_CALLS[0])]
 
-    agent = (out / "agent.py").read_text(encoding="utf-8")
+    prompt_module = (out / "system_prompt.py").read_text(encoding="utf-8")
     override = mapping[source_canary.token(*CANARY_CALLS[3])]
-    assert agent.count(f"finance override code {override}") == 2
+    assert prompt_module.count(f"finance override code {override}") == 2
+    assert override not in (out / "agent.py").read_text(encoding="utf-8")
 
 
 def test_each_blind_value_occurs_exactly_as_often_as_it_was_planted(
@@ -653,6 +654,8 @@ def test_manifest_has_no_canary_values_and_lists_inlining(
     assert len(manifest["canary_replacements"]) == len(CANARY_CALLS)
     for record in manifest["canary_replacements"]:
         assert set(record) == {"file", "line", "call", "slot"}
+    prompt_sites = [r for r in manifest["canary_replacements"] if r["slot"] == "prompt_secret"]
+    assert [r["file"] for r in prompt_sites] == ["system_prompt.py"]
     inlined = {entry["name"]: entry["uses"] for entry in manifest["inlined_constants"]}
     assert inlined == {name: uses for _, name, uses in CANARY_SITES}
 
@@ -672,7 +675,9 @@ def test_manifest_lists_accepted_behavioural_text(blind: tuple[Path, dict, Path,
 def test_manifest_records_edits(blind: tuple[Path, dict, Path, str]) -> None:
     _, manifest, _, _ = blind
     edited = {entry["file"]: entry["edits"] for entry in manifest["edited_files"]}
-    assert {"agent.py", "db/seed_data.py", "tools/external.py", "pyproject.toml"} <= set(edited)
+    assert {
+        "agent.py", "system_prompt.py", "db/seed_data.py", "tools/external.py", "pyproject.toml",
+    } <= set(edited)
     for edits in edited.values():
         for edit in edits:
             assert edit["action"] in {"removed", "replaced"}
