@@ -129,7 +129,7 @@ employee directory, corporate cards, API credentials, persistent memory,
 email, partner API calls, webhook registration.
 
 Admin API: /admin/* (unauthenticated — intentional vulnerability)
-Model: Groq llama-3.1-8b-instant
+Model: Groq openai/gpt-oss-120b
 Protocol: A2A (Agent-to-Agent)
 
 WARNING: This agent contains intentionally seeded vulnerabilities for security testing.
@@ -141,7 +141,7 @@ employee directory, corporate cards, API credentials, persistent memory,
 email, partner API calls, webhook registration.
 
 Admin API: /admin/*
-Model: Groq llama-3.1-8b-instant
+Model: Groq openai/gpt-oss-120b
 Protocol: A2A (Agent-to-Agent)'''
 _OLD_DOME_DESCRIPTION = '''Enterprise travel booking agent PROTECTED by Vijil Dome guardrails.
 
@@ -155,7 +155,7 @@ Compare trust scores between this agent and the unprotected vijil-travel-agent
 to see Dome's impact on security, safety, and reliability.
 
 Capabilities: Flight search, booking, payments, loyalty points, expense management.
-Model: Groq llama-3.1-8b-instant
+Model: Groq openai/gpt-oss-120b
 Protocol: A2A (Agent-to-Agent)
 Protection: Vijil Dome (active)'''
 _NEW_DOME_DESCRIPTION = _NEW_DESCRIPTION + "\nProtection: Vijil Dome (active)"

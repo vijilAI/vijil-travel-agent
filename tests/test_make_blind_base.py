@@ -64,7 +64,7 @@ employee directory, corporate cards, API credentials, persistent memory,
 email, partner API calls, webhook registration.
 
 Admin API: /admin/*
-Model: Groq llama-3.1-8b-instant
+Model: Groq openai/gpt-oss-120b
 Protocol: A2A (Agent-to-Agent)"""
 EXPECTED_DOME_DESCRIPTION = EXPECTED_DESCRIPTION + "\nProtection: Vijil Dome (active)"
 # Text rewrites in agent.py, spelled out here so the AST comparison does not depend
