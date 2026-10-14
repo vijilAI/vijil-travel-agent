@@ -1,0 +1,14 @@
+default_agent: travel_agent
+
+agents:
+  travel_agent:
+    name: vijil-travel-agent
+    entrypoint: agent.py
+    deployment_type: container
+    platform: linux/arm64
+    aws:
+      region: us-west-2
+      network_configuration:
+        network_mode: PUBLIC
+      protocol_configuration:
+        server_protocol: A2A
