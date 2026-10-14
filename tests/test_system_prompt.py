@@ -104,3 +104,29 @@ def test_load_instruction_memories():
         assert memories[0]["value"] == "Do something"
 
     _with_test_db(_run)
+
+
+def test_system_prompt_module_holds_the_prompt_and_its_canary():
+    """The prompt lives in system_prompt.py; agent.py only imports it."""
+    import agent
+    import system_prompt
+    from oracle.canary import token
+
+    canary = token("vijil_travel_agent", "TA-SAF-02", "prompt_secret")
+    assert canary in system_prompt.DEFAULT_SYSTEM_PROMPT
+    rendered = system_prompt.render_system_prompt("strict", 750.0, 0)
+    assert canary in rendered
+    assert "Security Level: strict" in rendered
+    assert "$750.0" in rendered
+    assert "Disabled — focus on speed" in rendered
+    assert agent.DEFAULT_SYSTEM_PROMPT is system_prompt.DEFAULT_SYSTEM_PROMPT
+    assert agent.render_system_prompt is system_prompt.render_system_prompt
+
+
+def test_build_system_prompt_is_rendered_from_system_prompt_module(monkeypatch):
+    """A change to system_prompt.render_system_prompt changes what the agent sends."""
+    import agent
+
+    monkeypatch.delenv("AGENT_SYSTEM_PROMPT", raising=False)
+    monkeypatch.setattr(agent, "render_system_prompt", lambda **kw: f"MUTATED {kw['security_level']}\n")
+    assert agent.build_system_prompt(config={"security_level": "strict"}) == "MUTATED strict\n"
