@@ -34,7 +34,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
-from strands import Agent
+from strands import Agent, ModelRetryStrategy
+from strands.hooks import AfterModelCallEvent
 from strands.models.openai import OpenAIModel
 from strands.multiagent.a2a.executor import StrandsA2AExecutor
 
@@ -155,6 +156,44 @@ class AgentRunBoundExceeded(RuntimeError):
     """An agent run hit its turn cap or wall-clock bound; it produced no answer."""
 
 
+class CancellableRetryStrategy(ModelRetryStrategy):
+    """Model-throttle retries that stop once the run's deadline has passed.
+
+    Strands' default strategy sleeps up to 64 s between retries without checking
+    cancellation, so a run abandoned at its deadline kept calling the model
+    after the client already had its 502. This one refuses to retry once
+    ``stop`` is set and sleeps in short slices, so a cancel lands within
+    ``_SLICE_S``. Its backoff (2, 4, 8 s; three attempts) fits inside the run's
+    own time bound.
+    """
+
+    _SLICE_S = 0.25
+
+    def __init__(self) -> None:
+        super().__init__(max_attempts=3, initial_delay=2, max_delay=8)
+        self.stop: threading.Event | None = None
+
+    def _stopped(self) -> bool:
+        return self.stop is not None and self.stop.is_set()
+
+    async def _handle_after_model_call(self, event: AfterModelCallEvent) -> None:
+        if event.retry or event.stop_response is not None or event.exception is None:
+            await super()._handle_after_model_call(event)
+            return
+        if self._stopped() or not self.is_retryable(event.exception):
+            return
+        self._current_attempt += 1
+        if self._current_attempt >= self._max_attempts:
+            return
+        deadline = time.monotonic() + self._calculate_delay(self._current_attempt - 1)
+        while time.monotonic() < deadline:
+            if self._stopped():
+                return
+            await asyncio.sleep(min(self._SLICE_S, deadline - time.monotonic()))
+        if not self._stopped():
+            event.retry = True
+
+
 class BoundedAgent(Agent):
     """A Strands Agent whose every invocation is bounded by ``RunBounds``.
 
@@ -167,6 +206,7 @@ class BoundedAgent(Agent):
     """
 
     def __init__(self, *args: Any, bounds: RunBounds, **kwargs: Any) -> None:
+        self._retry = kwargs.setdefault("retry_strategy", CancellableRetryStrategy())
         super().__init__(*args, **kwargs)
         self.bounds = bounds
 
@@ -176,6 +216,8 @@ class BoundedAgent(Agent):
             raise TypeError("BoundedAgent owns cancel_signal and limits; call cancel() instead")
         deadline = threading.Event()
         timer = asyncio.get_running_loop().call_later(self.bounds.timeout_s, deadline.set)
+        if isinstance(self._retry, CancellableRetryStrategy):
+            self._retry.stop = deadline  # no model retry once the run is cut off
         # strands annotates stream_async as AsyncIterator; it is an async generator.
         events = cast(
             AsyncGenerator[Any, None],
