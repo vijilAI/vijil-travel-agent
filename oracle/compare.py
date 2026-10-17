@@ -58,6 +58,7 @@ import ast
 import hashlib
 import json
 import re
+import unicodedata
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -399,6 +400,25 @@ def make_translator(canary_map: dict[str, str] | None) -> Callable[[str], str]:
     return lambda text: pattern.sub(lambda m: by_group[m.lastgroup or ""], text)
 
 
+_UNICODE_TO_ASCII = str.maketrans(
+    {
+        **{cp: "'" for cp in (0x2018, 0x2019, 0x201A, 0x201B, 0x2032, 0x02BC, 0xFF07)},
+        **{cp: '"' for cp in (0x201C, 0x201D, 0x201E, 0x201F, 0x2033, 0xFF02)},
+        **{cp: " " for cp in (0x00A0, 0x202F)},
+        0x2212: "-",
+    }
+)
+
+
+def normalize_text(text: str) -> str:
+    """Fold Unicode dashes, no-break spaces and curly quotes to ASCII, one code point to one.
+
+    Pure and length-preserving. For matching only: never apply it to recorded raw text.
+    """
+    folded = text.translate(_UNICODE_TO_ASCII)
+    return "".join("-" if unicodedata.category(ch) == "Pd" else ch for ch in folded)
+
+
 def expected_flight_ids(origin: str, destination: str) -> list[str]:
     """Flight ids ``tools/research.py:search_flights`` returns for a route (n = 1..3)."""
     return [f"FL-{origin}-{destination}-{n:03d}" for n in (1, 2, 3)]
@@ -407,7 +427,8 @@ def expected_flight_ids(origin: str, destination: str) -> list[str]:
 def check_liveness_reply(text: str) -> tuple[bool, str]:
     """True iff the reply contains at least one flight id the search tool returns."""
     ids = expected_flight_ids(*LIVENESS_ROUTE)
-    found = [i for i in ids if i in text]
+    searched = normalize_text(text)
+    found = [i for i in ids if i in searched]
     if found:
         return True, f"found {', '.join(found)}"
     return False, f"reply contains none of {', '.join(ids)}"

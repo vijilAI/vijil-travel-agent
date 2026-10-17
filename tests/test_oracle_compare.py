@@ -1309,3 +1309,127 @@ def test_stateful_probes_listed_only_when_actually_sent():
 
     side = asyncio.run(compare.run_side(_REG, ControlGarbageFirst, 2))
     assert side["stateful_probes_run"] == ["TA-REL-01-p1", "TA-REL-02-p1"]
+
+
+# ---------------------------------------------------------------------------
+# liveness control: Unicode normalization (DIAMOND-634)
+# ---------------------------------------------------------------------------
+
+_DASH_CODE_POINTS = [
+    0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x2015, 0x2212, 0xFE63, 0xFF0D,
+]
+
+
+@pytest.mark.parametrize("dash_cp", _DASH_CODE_POINTS, ids=lambda cp: f"U+{cp:04X}")
+def test_liveness_accepts_flight_id_written_with_unicode_dashes(dash_cp):
+    reply = "Flight " + "FL-SFO-JFK-002".replace("-", chr(dash_cp)) + " departs at 14:00"
+    ok, detail = compare.check_liveness_reply(reply)
+    assert ok, detail
+    assert "FL-SFO-JFK-002" in detail
+
+
+def test_liveness_accepts_unicode_dashes_after_narrow_no_break_space():
+    reply = "Option\u202f" + "FL-SFO-JFK-002".replace("-", "\u2011")
+    assert compare.check_liveness_reply(reply)[0]
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "FL-SFO-LAX-001".replace("-", "\u2011"),
+        "FL-SFO-JFK-009".replace("-", "\u2011"),
+        "FL-SFO-JFK-004".replace("-", "\u2011"),
+        "I can\u2019t help with that request.",
+    ],
+    ids=["wrong-route", "unknown-id-009", "unknown-id-004", "curly-refusal"],
+)
+def test_liveness_unicode_dashes_do_not_admit_a_wrong_or_unknown_flight(reply):
+    assert not compare.check_liveness_reply(reply)[0]
+
+
+def test_liveness_excerpt_stays_raw_not_normalized():
+    class Dashy:
+        async def chat(self, prompt, system_prompt=None):
+            return "FL\u2011SFO\u2011JFK\u2011002"
+
+    ok, _detail, excerpt = asyncio.run(compare._run_liveness_control(Dashy(), "p"))
+    assert ok
+    assert excerpt == "FL\u2011SFO\u2011JFK\u2011002"
+
+
+def test_normalize_text_contract():
+    import unicodedata
+
+    norm = compare.normalize_text
+    pd = [
+        cp for cp in range(0x10000)
+        if unicodedata.category(chr(cp)) == "Pd"
+    ] + [0x2212]
+    for cp in pd:
+        assert norm(chr(cp)) == "-", f"U+{cp:04X}"
+    for cp in (0x00A0, 0x202F):
+        assert norm(chr(cp)) == " "
+    for cp in (0x2018, 0x2019, 0x201A, 0x201B, 0x2032, 0x02BC, 0xFF07):
+        assert norm(chr(cp)) == "'", f"U+{cp:04X}"
+    for cp in (0x201C, 0x201D, 0x201E, 0x201F, 0x2033, 0xFF02):
+        assert norm(chr(cp)) == '"', f"U+{cp:04X}"
+    unchanged = (
+        0x2007, 0x3000, 0x0009, 0x000A, 0x00AB, 0x00BB, 0x2039, 0x203A, 0x00B4, 0x0060,
+    )
+    for cp in unchanged:
+        assert norm(chr(cp)) == chr(cp), f"U+{cp:04X}"
+    sample = "a\u2011b\u202fc\u2019d\u201ce\u00abf\u3000g"
+    out = norm(sample)
+    assert len(out) == len(sample)
+    assert norm(out) == out
+    assert out == "a-b c'd\"e\u00abf\u3000g"
+
+
+_CONTRACT_SPACES = frozenset({0x00A0, 0x202F})
+_CONTRACT_APOSTROPHES = frozenset({0x2018, 0x2019, 0x201A, 0x201B, 0x2032, 0x02BC, 0xFF07})
+_CONTRACT_QUOTES = frozenset({0x201C, 0x201D, 0x201E, 0x201F, 0x2033, 0xFF02})
+_CONTRACT_MINUS_SIGN = 0x2212
+_BMP_SIZE = 0x10000
+
+
+def _contract_expected(cp: int) -> str:
+    """The contract's output for one BMP code point, derived independent of compare."""
+    import unicodedata
+
+    ch = chr(cp)
+    if unicodedata.category(ch) == "Pd" or cp == _CONTRACT_MINUS_SIGN:
+        return "-"
+    if cp in _CONTRACT_SPACES:
+        return " "
+    if cp in _CONTRACT_APOSTROPHES:
+        return "'"
+    if cp in _CONTRACT_QUOTES:
+        return '"'
+    return ch
+
+
+def test_normalize_text_changes_no_bmp_code_point_outside_the_contract():
+    norm = compare.normalize_text
+    wrong = [
+        f"U+{cp:04X}->{norm(chr(cp))!r}"
+        for cp in range(_BMP_SIZE)
+        if norm(chr(cp)) != _contract_expected(cp)
+    ]
+    assert not wrong, wrong[:20]
+
+
+def test_normalize_text_is_length_preserving_and_idempotent_over_the_bmp():
+    norm = compare.normalize_text
+    every = "".join(chr(cp) for cp in range(_BMP_SIZE))
+    once = norm(every)
+    assert len(once) == len(every)
+    assert norm(once) == once
+
+
+@pytest.mark.parametrize(
+    "refusal_cp",
+    sorted(_CONTRACT_APOSTROPHES | _CONTRACT_QUOTES),
+    ids=lambda cp: f"U+{cp:04X}",
+)
+def test_liveness_refusal_with_any_quote_variant_stays_false(refusal_cp):
+    assert not compare.check_liveness_reply(f"I can{chr(refusal_cp)}t help with that.")[0]
