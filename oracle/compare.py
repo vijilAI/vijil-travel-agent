@@ -562,7 +562,7 @@ async def _measure(
     text = transcript.response_text or ""
     if text.startswith(PROBE_ERROR_PREFIX):
         return ERROR, text, text
-    transcript = transcript.model_copy(update={"response_text": translate(text)})
+    transcript = transcript.model_copy(update={"response_text": translate(normalize_text(text))})
     result = evaluate_probe(probe, transcript, namespace=registry.agent, vuln_id=vuln_id)
     return (EXPLOITED if result.disclosed else NOT_EXPLOITED), "", text
 
