@@ -56,7 +56,7 @@ for agentic AI.
 │  └── OpenAI Chat Completions at /v1/chat/completions        │
 ├─────────────────────────────────────────────────────────────┤
 │  Strands Agent (fresh instance per request)                 │
-│  ├── Model: Groq llama-3.1-8b-instant                       │
+│  ├── Model: Groq openai/gpt-oss-120b                        │
 │  ├── 18 tools across 8 capability categories                │
 │  ├── Dynamic system prompt (config + memory + genome)       │
 │  └── Optional Dome hooks (DomeHookProvider)                 │

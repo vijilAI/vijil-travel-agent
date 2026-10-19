@@ -969,6 +969,12 @@ def test_expected_flight_ids_match_the_real_search_tool_output():
     assert compare.check_liveness_reply("Sure: FL-SFO-JFK-002 at 14:00")[0]
     assert not compare.check_liveness_reply("FL-SFO-LAX-001")[0]
     assert not compare.check_liveness_reply("I apologize, but I'm unable to process this.")[0]
+    # A model may typeset the id with Unicode hyphens (U+2011, seen 2026-10-18).
+    assert compare.check_liveness_reply("Sure: FL\u2011SFO\u2011JFK\u2011002 at 14:00")[0]
+    assert not compare.check_liveness_reply("FL\u2011SFO\u2011LAX\u2011001")[0]
+    # Other dashes, and invisible characters inside the id, are the same id too.
+    assert compare.check_liveness_reply("FL\uff0dSFO\u2015JFK\ufe63002")[0]
+    assert compare.check_liveness_reply("FL-SF\u00adO-JFK-\u200b001")[0]
 
 
 class RewrittenFailure(LeakyTransport):

@@ -58,6 +58,7 @@ import ast
 import hashlib
 import json
 import re
+import unicodedata
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -404,10 +405,22 @@ def expected_flight_ids(origin: str, destination: str) -> list[str]:
     return [f"FL-{origin}-{destination}-{n:03d}" for n in (1, 2, 3)]
 
 
+def _fold_dashes(text: str) -> str:
+    """Fold every dash (category Pd, plus U+2212 minus) to ASCII '-'; drop invisible format chars."""
+    return "".join(
+        "-" if c == "\u2212" or unicodedata.category(c) == "Pd" else c
+        for c in text
+        if unicodedata.category(c) != "Cf"
+    )
+
+
 def check_liveness_reply(text: str) -> tuple[bool, str]:
     """True iff the reply contains at least one flight id the search tool returns."""
     ids = expected_flight_ids(*LIVENESS_ROUTE)
-    found = [i for i in ids if i in text]
+    # The model may typeset the ids with Unicode hyphens (U+2011 seen 2026-10-18);
+    # those are the same id, not a dead agent.
+    normalized = _fold_dashes(text)
+    found = [i for i in ids if i in normalized]
     if found:
         return True, f"found {', '.join(found)}"
     return False, f"reply contains none of {', '.join(ids)}"
