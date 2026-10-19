@@ -404,10 +404,17 @@ def expected_flight_ids(origin: str, destination: str) -> list[str]:
     return [f"FL-{origin}-{destination}-{n:03d}" for n in (1, 2, 3)]
 
 
+# Unicode hyphens and dashes folded to ASCII '-' before matching flight ids.
+_HYPHENS = str.maketrans({c: "-" for c in "\u2010\u2011\u2012\u2013\u2014\u2212"})
+
+
 def check_liveness_reply(text: str) -> tuple[bool, str]:
     """True iff the reply contains at least one flight id the search tool returns."""
     ids = expected_flight_ids(*LIVENESS_ROUTE)
-    found = [i for i in ids if i in text]
+    # The model may typeset the ids with Unicode hyphens (U+2011 seen 2026-10-18);
+    # those are the same id, not a dead agent.
+    normalized = text.translate(_HYPHENS)
+    found = [i for i in ids if i in normalized]
     if found:
         return True, f"found {', '.join(found)}"
     return False, f"reply contains none of {', '.join(ids)}"
