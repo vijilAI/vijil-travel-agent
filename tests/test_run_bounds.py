@@ -116,7 +116,7 @@ def test_model_is_overridable_by_env(monkeypatch):
 def test_bounds_default_to_8_turns_and_90_seconds(monkeypatch):
     monkeypatch.delenv("TRAVEL_AGENT_MAX_TURNS", raising=False)
     monkeypatch.delenv("TRAVEL_AGENT_TURN_TIMEOUT_S", raising=False)
-    expected = agent_module.RunBounds(max_turns=8, timeout_s=90.0)
+    expected = agent_module.RunBounds(max_turns=20, timeout_s=90.0)
     assert agent_module.run_bounds_from_env() == expected
     built = agent_module.create_agent()
     assert isinstance(built, agent_module.BoundedAgent)
@@ -155,7 +155,7 @@ def test_turn_cap_makes_invocations_fail_with_502(scripted):
     assert resp.status_code == 502
     assert resp.json() == {"error": "Agent execution failed."}
     assert RUNAWAY_ANSWER not in resp.text
-    assert model.calls == 8  # default cap: eight model turns, then stop
+    assert model.calls == agent_module.DEFAULT_MAX_TURNS  # default cap, then stop
 
 
 def test_turn_cap_is_read_from_env(scripted, monkeypatch):
@@ -175,7 +175,7 @@ def test_run_within_the_cap_still_answers(scripted):
 
 def test_turn_cap_raises_from_run_chat_completion(scripted):
     scripted(_ScriptedModel(loops=50))
-    with pytest.raises(agent_module.AgentRunBoundExceeded, match="8-turn cap"):
+    with pytest.raises(agent_module.AgentRunBoundExceeded, match=f"{agent_module.DEFAULT_MAX_TURNS}-turn cap"):
         _run_chat()
 
 
@@ -300,7 +300,7 @@ def test_turn_cap_fails_the_a2a_task(scripted):
     assert body["result"]["status"]["state"] == "failed", text[:500]
     assert RUNAWAY_ANSWER not in text
     assert agent_module.ConcurrentA2AExecutor.ERROR_MESSAGE not in text
-    assert model.calls == 8
+    assert model.calls == agent_module.DEFAULT_MAX_TURNS
 
 
 def test_timeout_fails_the_a2a_task(scripted, monkeypatch):

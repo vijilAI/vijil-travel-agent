@@ -107,7 +107,7 @@ MODEL_MAX_TOKENS = 4096
 # after TRAVEL_AGENT_MAX_TURNS model turns or TRAVEL_AGENT_TURN_TIMEOUT_S seconds,
 # whichever comes first, and raises. /invocations answers 502 and an A2A task ends
 # "failed"; /v1/chat/completions keeps its generic error text (ERROR_MESSAGE).
-DEFAULT_MAX_TURNS = 8
+DEFAULT_MAX_TURNS = 20
 DEFAULT_TURN_TIMEOUT_S = 90.0
 # The timeout cancels the run cooperatively (strands checks between model chunks
 # and tools). A tool that blocks past that point is abandoned this much later.
