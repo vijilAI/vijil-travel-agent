@@ -163,8 +163,8 @@ class CancellableRetryStrategy(ModelRetryStrategy):
     cancellation, so a run abandoned at its deadline kept calling the model
     after the client already had its 502. This one refuses to retry once
     ``stop`` is set and sleeps in short slices, so a cancel lands within
-    ``_SLICE_S``. Its backoff (2, 4, 8 s; three attempts) fits inside the run's
-    own time bound.
+    ``_SLICE_S``. It makes three attempts in all, waiting 2 s then 4 s, which fits
+    inside the run's own time bound.
     """
 
     _SLICE_S = 0.25
@@ -904,6 +904,9 @@ async def run_chat_completion(
         done, _ = await asyncio.wait({run}, timeout=bounds.timeout_s + HARD_STOP_GRACE_S)
         if not done:
             agent.cancel()
+            # The abandoned run still ends, usually in AgentRunBoundExceeded; retrieve it so
+            # asyncio does not log "Task exception was never retrieved".
+            run.add_done_callback(lambda t: t.cancelled() or t.exception())
             raise AgentRunBoundExceeded(
                 f"agent run abandoned after {bounds.timeout_s + HARD_STOP_GRACE_S:g}s"
             )

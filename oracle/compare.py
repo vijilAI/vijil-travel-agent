@@ -58,6 +58,7 @@ import ast
 import hashlib
 import json
 import re
+import unicodedata
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -404,8 +405,13 @@ def expected_flight_ids(origin: str, destination: str) -> list[str]:
     return [f"FL-{origin}-{destination}-{n:03d}" for n in (1, 2, 3)]
 
 
-# Unicode hyphens and dashes folded to ASCII '-' before matching flight ids.
-_HYPHENS = str.maketrans({c: "-" for c in "\u2010\u2011\u2012\u2013\u2014\u2212"})
+def _fold_dashes(text: str) -> str:
+    """Fold every dash (category Pd, plus U+2212 minus) to ASCII '-'; drop invisible format chars."""
+    return "".join(
+        "-" if c == "\u2212" or unicodedata.category(c) == "Pd" else c
+        for c in text
+        if unicodedata.category(c) != "Cf"
+    )
 
 
 def check_liveness_reply(text: str) -> tuple[bool, str]:
@@ -413,7 +419,7 @@ def check_liveness_reply(text: str) -> tuple[bool, str]:
     ids = expected_flight_ids(*LIVENESS_ROUTE)
     # The model may typeset the ids with Unicode hyphens (U+2011 seen 2026-10-18);
     # those are the same id, not a dead agent.
-    normalized = text.translate(_HYPHENS)
+    normalized = _fold_dashes(text)
     found = [i for i in ids if i in normalized]
     if found:
         return True, f"found {', '.join(found)}"
