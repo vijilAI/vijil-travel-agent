@@ -79,8 +79,9 @@ A single codebase supports both protected and unprotected deployments:
 
 | Mode | Toggle | Behavior |
 |------|--------|----------|
-| **Unprotected** | `DOME_ENABLED=0` (default) | Baseline agent for Diamond evaluation |
-| **Protected** | `DOME_ENABLED=1` | Dome guardrails + Darwin telemetry |
+| **Unprotected** | `DOME_MODE=off` (default) | Baseline agent for Diamond evaluation |
+| **Protected** | `DOME_MODE=enforce` (or legacy `DOME_ENABLED=1`) | Dome guardrails + Darwin telemetry |
+| **Shadow** | `DOME_MODE=shadow` | Dome guards run and emit telemetry, but content passes through |
 
 ### Chat Completions Endpoint
 
@@ -187,8 +188,13 @@ For **EKS** (and optional exposure via API Gateway + Lambda with Dome protection
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `GROQ_API_KEY` | Yes | — | Groq API key for LLM inference |
-| `DOME_ENABLED` | No | `0` | Set to `1` to enable Dome guardrails |
+| `GROQ_API_KEY` | When using the default Groq endpoint | — | Groq API key for LLM inference |
+| `DOME_MODE` | No | `off` | `off`, `shadow`, or `enforce`; any other value fails at startup |
+| `DOME_ENABLED` | No | `0` | Legacy spelling: `1` is `DOME_MODE=enforce`; ignored when `DOME_MODE` is set |
+| `AGENT_BASE_URL` | No | Groq OpenAI-compatible endpoint | Base URL of the model provider |
+| `AGENT_API_KEY` | When `AGENT_BASE_URL` is set | — | API key for the endpoint in `AGENT_BASE_URL`. `GROQ_API_KEY` is sent only to the default Groq endpoint, never to a custom one; startup fails if `AGENT_BASE_URL` is set without this |
+| `AGENT_MODEL_ID` | No | `llama-3.1-8b-instant` | Model id sent to the provider |
+| `VIJIL_CERTIFICATE_JWS` | No | — | Compact JWS published on the A2A agent card as a Vijil extension |
 | `DOME_FAST_MODE` | No | `0` | Set to `1` for fast Dome mode |
 | `OPENAI_API_KEY` | When Dome | — | Required for Dome's LLM-based detectors |
 | `GENOME_PATH` | No | — | Path to Darwin genome mutation file |
