@@ -18,7 +18,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import asyncio
+import concurrent.futures
+import contextvars
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -80,6 +83,70 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 DOME_ENABLED = os.environ.get("DOME_ENABLED", "0") == "1"
+
+
+def _read_timeout_seconds(raw: str) -> float:
+    """Parse a timeout setting; reject values that would not bound the run."""
+    seconds = float(raw)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(f"timeout must be a positive, finite number of seconds, got {raw!r}")
+    return seconds
+
+
+# Upper bound on one /v1/chat/completions agent run. It must stay below the calling
+# proxy's own timeout, or the proxy gives up first and the caller never sees the
+# typed 504. The checked-in Lambda proxy (handler.py) waits 30s upstream, so the
+# default is 25s: 5s of headroom for building and sending the 504 and for
+# scheduling jitter. Raise it only together with that proxy timeout.
+DEFAULT_CHAT_RUN_TIMEOUT_SECONDS = 25.0
+CHAT_RUN_TIMEOUT_SECONDS = _read_timeout_seconds(
+    os.environ.get("CHAT_RUN_TIMEOUT_SECONDS", str(DEFAULT_CHAT_RUN_TIMEOUT_SECONDS))
+)
+
+
+def _read_worker_count(raw: str) -> int:
+    """Parse a worker-count setting; reject values that would not run anything."""
+    count = int(raw)
+    if count <= 0:
+        raise ValueError(f"worker count must be a positive integer, got {raw!r}")
+    return count
+
+
+# Chat agent runs get their own bounded pool, not the loop's shared default one.
+# asyncio.wait_for abandons a run on timeout but CANNOT stop the worker thread
+# executing it: the Strands run keeps going, tools included, until it returns.
+# What the pool bounds: (1) at most this many abandoned runs can be live at once,
+# (2) a run still queued when its request times out is cancelled before it starts,
+# so it never runs late, and (3) stuck chat runs cannot starve other thread users.
+# What it does not do: stop a tool call already in flight, so a side-effecting
+# tool can still complete after the caller saw the 504, and a caller that retries
+# after a 504 can duplicate that side effect. KNOWN LIMIT, accepted 2026-10-23;
+# cancellation (stop before the next tool call) is tracked as DIAMOND-751.
+CHAT_RUN_MAX_WORKERS = _read_worker_count(os.environ.get("CHAT_RUN_MAX_WORKERS", "32"))
+_CHAT_RUN_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=CHAT_RUN_MAX_WORKERS, thread_name_prefix="chat-run"
+)
+
+
+class AgentRunTimeout(Exception):
+    """The run exceeded CHAT_RUN_TIMEOUT_SECONDS (not a TimeoutError raised inside the run)."""
+
+
+async def _run_agent_bounded(agent_run: Callable[[str], Any], user_text: str) -> Any:
+    """Run the agent in the chat pool, bounded by CHAT_RUN_TIMEOUT_SECONDS.
+
+    Raises AgentRunTimeout only when this deadline fired; a TimeoutError raised by
+    the run itself (for example a tool's socket timeout) propagates unchanged.
+    """
+    loop = asyncio.get_running_loop()
+    context = contextvars.copy_context()  # to_thread's behavior: keep tracing context in the worker
+    try:
+        async with asyncio.timeout(CHAT_RUN_TIMEOUT_SECONDS) as deadline:
+            return await loop.run_in_executor(_CHAT_RUN_EXECUTOR, context.run, agent_run, user_text)
+    except TimeoutError:
+        if deadline.expired():
+            raise AgentRunTimeout from None
+        raise
 
 
 # =============================================================================
@@ -659,6 +726,25 @@ def _chat_response(content: str, model: str = "llama-3.1-8b-instant") -> JSONRes
     })
 
 
+def _chat_timeout_response(timeout_seconds: float) -> JSONResponse:
+    """Build an OpenAI-style error body for an agent run that exceeded its time limit.
+
+    504 with an error object, not a chat completion: a timeout must not read as an
+    answer or as a refusal to a caller scoring the response.
+    """
+    return JSONResponse(
+        status_code=504,
+        content={
+            "error": {
+                "message": f"Agent run did not complete within {timeout_seconds} seconds",
+                "type": "timeout_error",
+                "param": None,
+                "code": "agent_run_timeout",
+            }
+        },
+    )
+
+
 def _openai_to_strands_messages(messages: list) -> list[dict]:
     """Convert OpenAI-format messages to Strands message format.
 
@@ -719,8 +805,11 @@ def add_chat_completions_endpoint(app: Any) -> None:
         # Run Strands agent in thread pool (Dome hooks guard input/output inside Agent)
         try:
             agent = create_agent(messages=history if history else None)
-            result = await asyncio.to_thread(agent, user_text)
+            result = await _run_agent_bounded(agent, user_text)
             response_text = str(result)
+        except AgentRunTimeout:
+            logger.warning(f"Agent run exceeded {CHAT_RUN_TIMEOUT_SECONDS}s in chat completions")
+            return _chat_timeout_response(CHAT_RUN_TIMEOUT_SECONDS)
         except Exception as e:
             logger.warning(f"Agent execution failed in chat completions: {e}")
             response_text = ConcurrentA2AExecutor.ERROR_MESSAGE

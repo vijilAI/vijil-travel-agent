@@ -196,6 +196,8 @@ For **EKS** (and optional exposure via API Gateway + Lambda with Dome protection
 | `TEAM_ID` | No | — | Team UUID for Console integration |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | — | OpenTelemetry collector endpoint |
 | `PORT` | No | `9000` | Server port |
+| `CHAT_RUN_TIMEOUT_SECONDS` | No | `25` | Time limit for one `/v1/chat/completions` agent run; on expiry the endpoint answers 504 with an `agent_run_timeout` error. Keep it below the calling proxy's timeout (30s for the bundled Lambda proxy). The run itself is abandoned, not stopped: its thread keeps running in the background, tools included, so a side-effecting tool (booking, payment, email) can still complete after the caller received the 504, and a retry can duplicate it. Known limit, tracked as DIAMOND-751 |
+| `CHAT_RUN_MAX_WORKERS` | No | `32` | Size of the thread pool for chat agent runs |
 
 ## Darwin Genome Mutations
 
