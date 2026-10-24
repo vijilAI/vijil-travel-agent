@@ -196,6 +196,9 @@ class _RecordingHookProvider:
 def _run_main_with(monkeypatch, mode_name: str) -> list[_RecordingDome]:
     """Run main() up to uvicorn with a fake vijil_dome; return the Dome instances built."""
     mode = agent.DomeMode(mode_name)
+    # main() now requires a key for the default endpoint. Set it here: CI has none, and a
+    # local run only passed because load_dotenv() found the workspace .env above the repo.
+    monkeypatch.setenv("GROQ_API_KEY", "groq-key-for-test")
     _RecordingDome.instances = []
     fake_dome = types.ModuleType("vijil_dome")
     fake_dome.Dome = _RecordingDome
