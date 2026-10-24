@@ -34,7 +34,7 @@ make eks-push
 
 This runs a linux/amd64 docker build, logs in to ECR, ensures the repository exists, tags the image as `:<git-sha>` and `:latest`, and pushes. Override the tag with `IMAGE_TAG=my-tag make eks-push` if needed.
 
-**Note:** The Dockerfile expects a local `vijil_dome-*.whl` in the repo (for Dome integration). If the build fails on `COPY vijil_dome-*.whl`, obtain or build the wheel from the vijil-dome repo and place it in the vijil-travel-agent root before running `make eks-push`.
+**Note:** The image installs `vijil-dome` from the exact pin in `requirements.txt`; no local wheel is needed.
 
 ---
 
