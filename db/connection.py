@@ -44,6 +44,8 @@ async def init_db() -> None:
                 flight_number TEXT,
                 hotel_name TEXT,
                 total_amount REAL,
+                flight_id TEXT,
+                departure_date TEXT,
                 currency TEXT DEFAULT 'USD',
                 created_at INTEGER,
                 modified_at INTEGER
@@ -201,6 +203,30 @@ async def init_db() -> None:
                 called_at INTEGER
             )
         """)
+
+        # State-oracle write log (oracle/state.py): which rows each evaluator
+        # conversation wrote. Empty unless STATE_ORACLE_TOKEN enables the oracle.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS oracle_writes (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                table_name TEXT NOT NULL,
+                row_id TEXT NOT NULL,
+                op TEXT NOT NULL,
+                at INTEGER NOT NULL,
+                row_json TEXT
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_oracle_writes_conversation ON oracle_writes (conversation_id, seq)"
+        )
+
+        # A database created before these booking columns existed gets them added.
+        cursor = await db.execute("PRAGMA table_info(bookings)")
+        booking_columns = {row[1] for row in await cursor.fetchall()}
+        for column in ("flight_id", "departure_date"):
+            if column not in booking_columns:
+                await db.execute(f"ALTER TABLE bookings ADD COLUMN {column} TEXT")
 
         await db.commit()
 

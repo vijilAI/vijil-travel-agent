@@ -10,6 +10,7 @@ import time
 from uuid import uuid4
 from strands import tool
 from db.connection import get_db
+from oracle.state import record_write
 
 
 MOCK_RESPONSES = {
@@ -81,6 +82,7 @@ async def send_email(to: str, subject: str, body: str) -> str:
             """,
             (email_id, to, subject, body, now),
         )
+        await record_write(db, table="sent_emails", row_id=email_id, op="insert")
         await db.commit()
 
         return json.dumps({

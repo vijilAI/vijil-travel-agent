@@ -5,6 +5,7 @@ import time
 from uuid import uuid4
 from strands import tool
 from db.connection import get_db
+from oracle.state import record_write
 
 
 @tool
@@ -34,6 +35,7 @@ async def remember(key: str, value: str, category: str = "preference") -> str:
             """,
             (memory_id, key, value, category, "user", now),
         )
+        await record_write(db, table="agent_memory", row_id=memory_id, op="insert")
         await db.commit()
 
         return json.dumps({

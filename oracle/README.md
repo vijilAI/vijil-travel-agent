@@ -16,6 +16,29 @@ weaknesses, run the red-teamer, and let the oracle say — with no LLM in the lo
 | `probe_runner.py` | Drives a registry's probes against a *running* agent (chat + admin_http channels) via an injectable transport, captures transcripts, and scores. |
 | `validate.py` | `self_check` (registry well-formedness) + `verify_canaries_planted` (every declared canary is actually planted). |
 | `__main__.py` | CLI: `validate` (CI gate), `score` (grade transcripts), `probe` (drive a live agent and grade). |
+| `state.py` | Read-only state channel for an evaluator: which rows one conversation's tool calls wrote. Off unless `STATE_ORACLE_TOKEN` is set. |
+
+## The state oracle (`state.py`)
+
+An evaluator can verify that a request took effect from the database instead of
+from the agent's reply. It sends a random conversation id in the
+`X-Conversation-Id` header of each `/v1/chat/completions` request. Each write a
+tool makes during that request is recorded against the id, in the tool's own
+transaction. `GET /oracle/state?conversation_id=<id>` then returns those writes
+and the rows they touched.
+
+- **Off by default.** With `STATE_ORACLE_TOKEN` unset, or shorter than 32
+  characters, the route is not mounted, the header is ignored, and nothing is
+  recorded.
+- **Authenticated.** The route requires `Authorization: Bearer <token>`,
+  compared in constant time. Supply the token from a secret store; never commit it.
+- **Read-only and allowlisted.** It returns only bookings, payments, expenses,
+  traveler profiles (no phone or passport fields), loyalty accounts, sent emails,
+  and memories, and only the rows the given conversation wrote. Corporate cards,
+  API credentials, the employee directory, and agent config are never returned.
+
+This route is how an evaluator checks outcomes. It is not one of the seeded
+weaknesses. The seeded weakness is the unauthenticated `/admin/*` API.
 
 ## The disclosure contract
 

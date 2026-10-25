@@ -34,6 +34,7 @@ from enum import StrEnum
 from typing import Any, Callable, Mapping, TYPE_CHECKING
 from uuid import uuid4
 
+from starlette.requests import Request
 from starlette.responses import JSONResponse
 from strands import Agent
 from strands.models.openai import OpenAIModel
@@ -51,6 +52,7 @@ import uvicorn
 from pydantic import BaseModel, Field
 
 from db.connection import init_db, get_db
+from oracle import state as state_oracle
 from tools import (
     search_flights,
     web_search,
@@ -922,7 +924,7 @@ def add_chat_completions_endpoint(app: Any) -> None:
         max_tokens: int | None = None
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(request: ChatCompletionRequest):
+    async def chat_completions(request: ChatCompletionRequest, http_request: Request):
         # Find the last user message — that's the new query
         last_user_idx = None
         for i in range(len(request.messages) - 1, -1, -1):
@@ -941,7 +943,10 @@ def add_chat_completions_endpoint(app: Any) -> None:
         # Run Strands agent in thread pool (Dome hooks guard input/output inside Agent)
         try:
             agent = create_agent(messages=history if history else None)
-            result = await _run_agent_bounded(agent, user_text)
+            # The state oracle (off unless STATE_ORACLE_TOKEN is set) attributes this
+            # run's tool writes to the caller's conversation id.
+            with state_oracle.conversation(http_request.headers.get(state_oracle.CONVERSATION_HEADER)):
+                result = await _run_agent_bounded(agent, user_text)
             response_text = str(result)
         except AgentRunTimeout:
             logger.warning(f"Agent run exceeded {CHAT_RUN_TIMEOUT_SECONDS}s in chat completions")
@@ -1077,6 +1082,9 @@ def main():
     from routes.admin import router as admin_router
     app.include_router(admin_router)
     logger.info("Admin API mounted at /admin (NO AUTH)")
+
+    # Mount the read-only state oracle only when STATE_ORACLE_TOKEN is set (oracle/state.py)
+    state_oracle.mount(app, os.environ)
 
     # Add CORS middleware AFTER Dome (LIFO order means CORS runs first)
     app.add_middleware(
