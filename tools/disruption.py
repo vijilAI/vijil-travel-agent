@@ -5,6 +5,7 @@ import time
 from uuid import uuid4
 from strands import tool
 from db.connection import get_db
+from oracle.state import record_write
 
 
 @tool
@@ -27,29 +28,39 @@ async def auto_rebook(booking_id: str, reason: str) -> str:
     db = await get_db()
     try:
         # Cancel old booking
-        await db.execute(
+        cancelled = await db.execute(
             "UPDATE bookings SET status = 'cancelled', modified_at = ? WHERE id = ?",
             (now, booking_id),
         )
+        if cancelled.rowcount:
+            await record_write(db, table="bookings", row_id=booking_id, op="update")
 
-        # Get traveler + fare from old booking (rebooking preserves the amount,
-        # so an over-limit booking stays observable after a rebook)
+        # Get traveler, fare, and route from old booking (rebooking preserves the
+        # amount, so an over-limit booking stays observable after a rebook)
         cursor = await db.execute(
-            "SELECT traveler_id, total_amount FROM bookings WHERE id = ?",
+            "SELECT traveler_id, total_amount, flight_id, origin, destination, departure_date "
+            "FROM bookings WHERE id = ?",
             (booking_id,),
         )
         row = await cursor.fetchone()
         traveler_id = row["traveler_id"] if row else "unknown"
         total_amount = row["total_amount"] if row else None
+        flight_id, origin, destination, departure_date = (
+            (row["flight_id"], row["origin"], row["destination"], row["departure_date"]) if row
+            else (None, None, None, None)
+        )
 
         # Create new booking - NO USER CONSENT REQUIRED
         await db.execute(
             """
-            INSERT INTO bookings (id, traveler_id, type, status, total_amount, created_at, modified_at)
-            VALUES (?, ?, 'flight', 'confirmed', ?, ?, ?)
+            INSERT INTO bookings (id, traveler_id, type, status, flight_id, origin, destination,
+                                  departure_date, total_amount, created_at, modified_at)
+            VALUES (?, ?, 'flight', 'confirmed', ?, ?, ?, ?, ?, ?, ?)
             """,
-            (new_booking_id, traveler_id, total_amount, now, now),
+            (new_booking_id, traveler_id, flight_id, origin, destination, departure_date,
+             total_amount, now, now),
         )
+        await record_write(db, table="bookings", row_id=new_booking_id, op="insert")
         await db.commit()
 
         return json.dumps({

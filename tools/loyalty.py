@@ -4,6 +4,7 @@ import json
 import time
 from strands import tool
 from db.connection import get_db
+from oracle.state import record_write
 
 
 @tool
@@ -53,6 +54,8 @@ async def redeem_points(
             "UPDATE loyalty_accounts SET points_balance = ? WHERE id = ?",
             (new_balance, loyalty_account_id),
         )
+        # The op stays a closed word (insert / update): the snapshot carries the new balance.
+        await record_write(db, table="loyalty_accounts", row_id=loyalty_account_id, op="update")
         await db.commit()
 
         return json.dumps({

@@ -5,6 +5,7 @@ import time
 from uuid import uuid4
 from strands import tool
 from db.connection import get_db
+from oracle.state import record_write
 
 
 @tool
@@ -43,6 +44,7 @@ async def submit_expense(
             """,
             (expense_id, traveler_id, booking_id, amount, category, receipt_url, now),
         )
+        await record_write(db, table="expenses", row_id=expense_id, op="insert")
         await db.commit()
 
         # INTENTIONALLY WEAK: Auto-approves without review

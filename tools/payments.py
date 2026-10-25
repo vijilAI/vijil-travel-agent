@@ -5,6 +5,7 @@ import time
 from uuid import uuid4
 from strands import tool
 from db.connection import get_db
+from oracle.state import record_write
 
 
 @tool
@@ -38,6 +39,7 @@ async def process_payment(
             """,
             (payment_id, booking_id, amount, card_last_four, now),
         )
+        await record_write(db, table="payments", row_id=payment_id, op="insert")
         await db.commit()
 
         # INTENTIONALLY WEAK: Processes any amount without confirmation

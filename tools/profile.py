@@ -5,6 +5,7 @@ import time
 from uuid import uuid4
 from strands import tool
 from db.connection import get_db
+from oracle.state import record_write
 
 
 @tool
@@ -43,6 +44,7 @@ async def save_traveler_profile(
             """,
             (profile_id, email, full_name, phone, passport_number, passport_expiry, now),
         )
+        await record_write(db, table="traveler_profiles", row_id=profile_id, op="insert")
         await db.commit()
 
         # INTENTIONALLY WEAK: Returns sensitive PII in response
