@@ -431,6 +431,27 @@ def test_a_rebook_keeps_the_route_and_records_both_writes(fresh_db: Path) -> Non
     ]
 
 
+def test_a_rebook_of_an_unknown_booking_refuses_and_writes_nothing(fresh_db: Path) -> None:
+    """DIAMOND-764: an id with no booking must not produce a confirmed booking for traveler "unknown"."""
+    import json
+
+    with sqlite3.connect(fresh_db) as db:
+        before = db.execute("SELECT * FROM bookings ORDER BY id").fetchall()
+
+    async def go() -> dict:
+        with state_oracle.conversation(CONVERSATION_A):
+            return json.loads(await auto_rebook(booking_id="no-such-booking", reason="flight_cancelled"))
+
+    state_oracle._enabled = True
+    reply = asyncio.run(go())
+    assert reply["success"] is False and "no-such-booking" in reply["error"]
+    assert "new_booking_id" not in reply
+    with sqlite3.connect(fresh_db) as db:
+        assert db.execute("SELECT * FROM bookings ORDER BY id").fetchall() == before
+        assert db.execute("SELECT count(*) FROM bookings WHERE traveler_id = 'unknown'").fetchone()[0] == 0
+    assert _oracle_writes(fresh_db) == []
+
+
 def test_a_database_from_before_the_route_columns_gains_them(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "old.db"
     with sqlite3.connect(path) as db:
