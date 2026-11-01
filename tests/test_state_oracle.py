@@ -25,6 +25,7 @@ from tools.booking import create_booking
 from tools.disruption import auto_rebook
 from tools.payments import process_payment
 from tools.profile import save_traveler_profile
+from tests.fake_agent import FakeAgent
 
 TOKEN = "t" * 40
 CONVERSATION_A = "conv-" + "a" * 32
@@ -42,13 +43,14 @@ def fresh_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     state_oracle._enabled = False  # mount() sets it process-wide; never leak it to another test
 
 
-class _BookingAgent:
+class _BookingAgent(FakeAgent):
     """Stands in for the Strands agent: books through the real tool, via Strands' own async runner.
 
     It says nothing about the booking in its reply, so only the database can show it happened.
     """
 
     def __init__(self, traveler: str, barrier: threading.Barrier | None = None):
+        super().__init__()
         self._traveler = traveler
         self._barrier = barrier
 

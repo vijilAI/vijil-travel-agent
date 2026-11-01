@@ -27,6 +27,7 @@ import logging
 import math
 import os
 import sqlite3
+import threading
 import time
 import tomllib
 from pathlib import Path
@@ -37,6 +38,7 @@ from uuid import uuid4
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from strands import Agent
+from strands.hooks import BeforeToolCallEvent, HookProvider, HookRegistry
 from strands.models.openai import OpenAIModel
 from strands.multiagent.a2a.executor import StrandsA2AExecutor
 
@@ -144,15 +146,15 @@ def _read_worker_count(raw: str) -> int:
 
 
 # Chat agent runs get their own bounded pool, not the loop's shared default one.
-# asyncio.wait_for abandons a run on timeout but CANNOT stop the worker thread
-# executing it: the Strands run keeps going, tools included, until it returns.
-# What the pool bounds: (1) at most this many abandoned runs can be live at once,
-# (2) a run still queued when its request times out is cancelled before it starts,
-# so it never runs late, and (3) stuck chat runs cannot starve other thread users.
-# What it does not do: stop a tool call already in flight, so a side-effecting
-# tool can still complete after the caller saw the 504, and a caller that retries
-# after a 504 can duplicate that side effect. KNOWN LIMIT, accepted 2026-10-23;
-# cancellation (stop before the next tool call) is tracked as DIAMOND-751.
+# A timeout cannot kill the worker thread executing a run. What stops a timed-out
+# run is cooperative (DIAMOND-751): RunCancellation refuses every tool call that
+# would start after the deadline, and Agent.cancel() ends the loop at its next
+# checkpoint, so the model is not asked for another step. What the pool bounds:
+# (1) at most this many abandoned runs can be live at once, (2) a run still queued
+# when its request times out is cancelled before it starts, so it never runs late,
+# and (3) stuck chat runs cannot starve other thread users. Still not stoppable: a
+# tool already in flight at the deadline runs to completion. The 504 reports how
+# many tool calls had started, so a caller knows whether a retry could duplicate one.
 CHAT_RUN_MAX_WORKERS = _read_worker_count(os.environ.get("CHAT_RUN_MAX_WORKERS", "32"))
 _CHAT_RUN_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=CHAT_RUN_MAX_WORKERS, thread_name_prefix="chat-run"
@@ -162,21 +164,61 @@ _CHAT_RUN_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 class AgentRunTimeout(Exception):
     """The run exceeded CHAT_RUN_TIMEOUT_SECONDS (not a TimeoutError raised inside the run)."""
 
+    def __init__(self, tool_calls_started: int):
+        super().__init__(f"{tool_calls_started} tool call(s) had started")
+        self.tool_calls_started = tool_calls_started
 
-async def _run_agent_bounded(agent_run: Callable[[str], Any], user_text: str) -> Any:
+
+class RunCancellation(HookProvider):
+    """Refuses every tool call a run would start after it is cancelled, and counts those it let start.
+
+    The admission check and cancel() share a lock, so the count cancel() returns is
+    exact: no tool call starts after it, and every one it counted was let through.
+    """
+
+    REFUSAL = "Not executed: the request timed out before this tool call."
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cancelled = False
+        self._started = 0
+
+    def register_hooks(self, registry: HookRegistry, **kwargs: Any) -> None:
+        registry.add_callback(BeforeToolCallEvent, self._admit)
+
+    def _admit(self, event: BeforeToolCallEvent) -> None:
+        with self._lock:
+            if self._cancelled:
+                event.cancel_tool = self.REFUSAL
+                return
+            self._started += 1
+
+    def cancel(self) -> int:
+        """Refuse all later tool calls; return how many had already started."""
+        with self._lock:
+            self._cancelled = True
+            return self._started
+
+
+async def _run_agent_bounded(agent: Agent, user_text: str) -> Any:
     """Run the agent in the chat pool, bounded by CHAT_RUN_TIMEOUT_SECONDS.
 
-    Raises AgentRunTimeout only when this deadline fired; a TimeoutError raised by
-    the run itself (for example a tool's socket timeout) propagates unchanged.
+    Raises AgentRunTimeout only when this deadline fired, after cancelling the run
+    so it starts no further tool call; a TimeoutError raised by the run itself (for
+    example a tool's socket timeout) propagates unchanged.
     """
+    cancellation = RunCancellation()
+    agent.hooks.add_hook(cancellation)
     loop = asyncio.get_running_loop()
     context = contextvars.copy_context()  # to_thread's behavior: keep tracing context in the worker
     try:
         async with asyncio.timeout(CHAT_RUN_TIMEOUT_SECONDS) as deadline:
-            return await loop.run_in_executor(_CHAT_RUN_EXECUTOR, context.run, agent_run, user_text)
+            return await loop.run_in_executor(_CHAT_RUN_EXECUTOR, context.run, agent, user_text)
     except TimeoutError:
         if deadline.expired():
-            raise AgentRunTimeout from None
+            tool_calls_started = cancellation.cancel()
+            agent.cancel()  # thread-safe; ends the loop before its next model call
+            raise AgentRunTimeout(tool_calls_started) from None
         raise
 
 
@@ -864,20 +906,26 @@ def _chat_response(content: str, model: str = "llama-3.1-8b-instant") -> JSONRes
     })
 
 
-def _chat_timeout_response(timeout_seconds: float) -> JSONResponse:
+def _chat_timeout_response(timeout_seconds: float, tool_calls_started: int) -> JSONResponse:
     """Build an OpenAI-style error body for an agent run that exceeded its time limit.
 
     504 with an error object, not a chat completion: a timeout must not read as an
-    answer or as a refusal to a caller scoring the response.
+    answer or as a refusal to a caller scoring the response. ``tool_calls_started``
+    tells the caller whether a side effect may already have happened; no tool call
+    starts after the timeout.
     """
     return JSONResponse(
         status_code=504,
         content={
             "error": {
-                "message": f"Agent run did not complete within {timeout_seconds} seconds",
+                "message": (
+                    f"Agent run did not complete within {timeout_seconds} seconds; "
+                    f"{tool_calls_started} tool call(s) had started and may have taken effect"
+                ),
                 "type": "timeout_error",
                 "param": None,
                 "code": "agent_run_timeout",
+                "tool_calls_started": tool_calls_started,
             }
         },
     )
@@ -948,9 +996,12 @@ def add_chat_completions_endpoint(app: Any) -> None:
             with state_oracle.conversation(http_request.headers.get(state_oracle.CONVERSATION_HEADER)):
                 result = await _run_agent_bounded(agent, user_text)
             response_text = str(result)
-        except AgentRunTimeout:
-            logger.warning(f"Agent run exceeded {CHAT_RUN_TIMEOUT_SECONDS}s in chat completions")
-            return _chat_timeout_response(CHAT_RUN_TIMEOUT_SECONDS)
+        except AgentRunTimeout as timeout:
+            logger.warning(
+                f"Agent run exceeded {CHAT_RUN_TIMEOUT_SECONDS}s in chat completions "
+                f"({timeout.tool_calls_started} tool call(s) had started)"
+            )
+            return _chat_timeout_response(CHAT_RUN_TIMEOUT_SECONDS, timeout.tool_calls_started)
         except Exception as e:
             logger.warning(f"Agent execution failed in chat completions: {e}")
             response_text = ConcurrentA2AExecutor.ERROR_MESSAGE
