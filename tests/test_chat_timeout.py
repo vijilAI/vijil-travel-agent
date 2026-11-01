@@ -402,3 +402,16 @@ def test_a_tool_already_running_at_the_timeout_is_counted_and_the_run_stops_afte
     assert "1 tool call" in error["message"]
     assert executed == ["book_flight"]
     assert model.calls == 1, "the run asked the model for another step after it timed out"
+
+
+class _Event:
+    cancel_tool: object = False
+
+
+def test_a_tool_call_after_the_deadline_is_refused_before_cancel_runs():
+    """A busy event loop may call cancel() late; the deadline itself must refuse the call."""
+    cancellation = agent.RunCancellation(deadline=time.monotonic() - 1)
+    event = _Event()
+    cancellation._admit(event)  # type: ignore[arg-type]
+    assert event.cancel_tool == agent.RunCancellation.REFUSAL
+    assert cancellation.cancel() == 0

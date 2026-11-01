@@ -174,11 +174,14 @@ class RunCancellation(HookProvider):
 
     The admission check and cancel() share a lock, so the count cancel() returns is
     exact: no tool call starts after it, and every one it counted was let through.
+    ``deadline`` (a time.monotonic() value) refuses calls once it passes, even before
+    a busy event loop gets round to calling cancel().
     """
 
     REFUSAL = "Not executed: the request timed out before this tool call."
 
-    def __init__(self) -> None:
+    def __init__(self, deadline: float | None = None) -> None:
+        self._deadline = deadline
         self._lock = threading.Lock()
         self._cancelled = False
         self._started = 0
@@ -188,7 +191,7 @@ class RunCancellation(HookProvider):
 
     def _admit(self, event: BeforeToolCallEvent) -> None:
         with self._lock:
-            if self._cancelled:
+            if self._cancelled or (self._deadline is not None and time.monotonic() >= self._deadline):
                 event.cancel_tool = self.REFUSAL
                 return
             self._started += 1
@@ -207,7 +210,7 @@ async def _run_agent_bounded(agent: Agent, user_text: str) -> Any:
     so it starts no further tool call; a TimeoutError raised by the run itself (for
     example a tool's socket timeout) propagates unchanged.
     """
-    cancellation = RunCancellation()
+    cancellation = RunCancellation(time.monotonic() + CHAT_RUN_TIMEOUT_SECONDS)
     agent.hooks.add_hook(cancellation)
     loop = asyncio.get_running_loop()
     context = contextvars.copy_context()  # to_thread's behavior: keep tracing context in the worker
