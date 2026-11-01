@@ -217,8 +217,10 @@ async def _run_agent_bounded(agent: Agent, user_text: str) -> Any:
     except TimeoutError:
         if deadline.expired():
             tool_calls_started = cancellation.cancel()
-            agent.cancel()  # thread-safe; ends the loop before its next model call
-            raise AgentRunTimeout(tool_calls_started) from None
+            try:
+                agent.cancel()  # thread-safe; ends the loop before its next model call
+            finally:  # the 504 never depends on the run cancelling cleanly
+                raise AgentRunTimeout(tool_calls_started) from None
         raise
 
 

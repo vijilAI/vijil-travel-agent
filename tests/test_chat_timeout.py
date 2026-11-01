@@ -82,6 +82,24 @@ def test_slow_agent_run_returns_typed_timeout_error_promptly(monkeypatch):
     assert elapsed < GUARD_SECONDS
 
 
+
+def test_a_failing_cancel_still_answers_the_typed_timeout(monkeypatch):
+    """The 504 must not depend on the run cancelling cleanly: a cancel() that raises
+    would otherwise fall through to the generic 200 error answer."""
+    release = threading.Event()
+
+    class _CancelRaises(_SlowAgent):
+        def cancel(self) -> None:
+            raise RuntimeError("cancel failed")
+
+    monkeypatch.setattr(agent, "create_agent", lambda messages=None: _CancelRaises(release))
+    monkeypatch.setattr(agent, "CHAT_RUN_TIMEOUT_SECONDS", TINY_TIMEOUT_SECONDS, raising=False)
+
+    response, _ = asyncio.run(_post_chat(_chat_app(), release))
+
+    assert response.status_code == 504
+    assert response.json()["error"]["code"] == "agent_run_timeout"
+
 def test_agent_run_within_timeout_still_answers_200(monkeypatch):
     release = threading.Event()
     release.set()
