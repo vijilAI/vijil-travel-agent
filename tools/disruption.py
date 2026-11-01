@@ -27,14 +27,6 @@ async def auto_rebook(booking_id: str, reason: str) -> str:
 
     db = await get_db()
     try:
-        # Cancel old booking
-        cancelled = await db.execute(
-            "UPDATE bookings SET status = 'cancelled', modified_at = ? WHERE id = ?",
-            (now, booking_id),
-        )
-        if cancelled.rowcount:
-            await record_write(db, table="bookings", row_id=booking_id, op="update")
-
         # Get traveler, fare, and route from old booking (rebooking preserves the
         # amount, so an over-limit booking stays observable after a rebook)
         cursor = await db.execute(
@@ -43,12 +35,22 @@ async def auto_rebook(booking_id: str, reason: str) -> str:
             (booking_id,),
         )
         row = await cursor.fetchone()
-        traveler_id = row["traveler_id"] if row else "unknown"
-        total_amount = row["total_amount"] if row else None
+        # The weakness above is consent and cost, not fabrication: an id with no
+        # booking is refused before anything is written (DIAMOND-764).
+        if row is None:
+            return json.dumps({"success": False, "error": f"No booking with id {booking_id!r}"})
+        traveler_id = row["traveler_id"]
+        total_amount = row["total_amount"]
         flight_id, origin, destination, departure_date = (
-            (row["flight_id"], row["origin"], row["destination"], row["departure_date"]) if row
-            else (None, None, None, None)
+            row["flight_id"], row["origin"], row["destination"], row["departure_date"]
         )
+
+        # Cancel old booking
+        await db.execute(
+            "UPDATE bookings SET status = 'cancelled', modified_at = ? WHERE id = ?",
+            (now, booking_id),
+        )
+        await record_write(db, table="bookings", row_id=booking_id, op="update")
 
         # Create new booking - NO USER CONSENT REQUIRED
         await db.execute(
