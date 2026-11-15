@@ -4,12 +4,16 @@
 #
 # Requires: doctl, docker buildx, envsubst, curl, jq.
 # Env: DIGITALOCEAN_ACCESS_TOKEN, GROQ_API_KEY, OPENAI_API_KEY
+#      STATE_ORACLE_TOKEN (>= 32 chars): bearer token for GET /oracle/state, shared with the
+#      evaluator that reads it (Red Swarm's TARGET_STATE_ORACLE_TOKEN)
 #      AGENT_MODEL_ID (default: llama-3.3-70b-versatile on Groq)
 # Prints the public base URL (ending in /v1) on the last line of stdout.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 : "${DIGITALOCEAN_ACCESS_TOKEN:?}" "${GROQ_API_KEY:?}" "${OPENAI_API_KEY:?}"
+: "${STATE_ORACLE_TOKEN:?}"
+[ "${#STATE_ORACLE_TOKEN}" -ge 32 ] || { echo "STATE_ORACLE_TOKEN must be at least 32 characters." >&2; exit 1; }
 export AGENT_MODEL_ID="${AGENT_MODEL_ID:-llama-3.3-70b-versatile}"
 REGISTRY=registry.digitalocean.com/vijil
 
@@ -26,7 +30,7 @@ curl -fsS https://api.groq.com/openai/v1/models -H "Authorization: Bearer $GROQ_
 doctl registry login --expiry-seconds 1200 >&2
 docker buildx build --platform linux/amd64 --push -t "$REGISTRY/travel-agent:$IMAGE_TAG" . >&2
 
-envsubst '${IMAGE_TAG} ${AGENT_MODEL_ID} ${GROQ_API_KEY} ${OPENAI_API_KEY}' < deploy/do-app.yaml \
+envsubst '${IMAGE_TAG} ${AGENT_MODEL_ID} ${GROQ_API_KEY} ${OPENAI_API_KEY} ${STATE_ORACLE_TOKEN}' < deploy/do-app.yaml \
   | doctl apps create --upsert --wait --spec - --output json >/dev/null
 
 URL="$(doctl apps list --output json | jq -r '.[] | select(.spec.name=="vijil-travel-agent") | .live_url')"
@@ -39,5 +43,7 @@ curl -fsS -m 120 "$URL/v1/chat/completions" -H 'Content-Type: application/json' 
   | jq -e '.choices[0].message.content | length > 0' >&2
 code="$(curl -s -o /dev/null -w '%{http_code}' "$URL/admin/api-keys")"
 [ "$code" = 404 ] || { echo "SECURITY: /admin/api-keys returned $code, expected 404." >&2; exit 1; }
+code="$(curl -s -o /dev/null -w '%{http_code}' "$URL/oracle/state?conversation_id=smoke")"
+[ "$code" = 401 ] || { echo "SECURITY: /oracle/state without a token returned $code, expected 401." >&2; exit 1; }
 
 echo "$URL/v1"
