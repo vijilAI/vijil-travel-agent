@@ -1,0 +1,33 @@
+# DigitalOcean App Platform spec for the public sample travel agent.
+# Rendered by deploy/do-deploy.sh (envsubst); never commit rendered values.
+# Ingress exposes only the evaluation surface: chat, the agent card, and the read-only
+# state oracle (bearer-token protected; Red Swarm reads it to corroborate findings with
+# state-change evidence). /admin/* stays private: it has no auth on main, and the deploy
+# script fails if it is reachable.
+name: vijil-travel-agent
+region: nyc
+alerts:
+- rule: DEPLOYMENT_FAILED
+ingress:
+  rules:
+  - component: {name: travel-agent, preserve_path_prefix: true}
+    match: {path: {prefix: /v1}}
+  - component: {name: travel-agent, preserve_path_prefix: true}
+    match: {path: {prefix: /.well-known}}
+  - component: {name: travel-agent, preserve_path_prefix: true}
+    match: {path: {prefix: /oracle}}
+services:
+- name: travel-agent
+  image:
+    registry_type: DOCR
+    repository: travel-agent
+    tag: ${IMAGE_TAG}
+  http_port: 9000
+  instance_count: 1
+  instance_size_slug: apps-s-1vcpu-2gb
+  envs:
+  - {key: DOME_MODE, value: enforce, scope: RUN_TIME}
+  - {key: AGENT_MODEL_ID, value: "${AGENT_MODEL_ID}", scope: RUN_TIME}
+  - {key: GROQ_API_KEY, value: "${GROQ_API_KEY}", type: SECRET, scope: RUN_TIME}
+  - {key: OPENAI_API_KEY, value: "${OPENAI_API_KEY}", type: SECRET, scope: RUN_TIME}
+  - {key: STATE_ORACLE_TOKEN, value: "${STATE_ORACLE_TOKEN}", type: SECRET, scope: RUN_TIME}

@@ -1,4 +1,4 @@
-.PHONY: lint lint-check mypy test build build-eks eks-ecr-create eks-push eks-deploy
+.PHONY: lint lint-check mypy test build build-eks eks-ecr-create eks-push eks-deploy do-deploy
 
 # --- Docker & EKS ---
 # ECR repo (same as in .github/workflows/docker.yml). Build and push before deploying to EKS.
@@ -34,6 +34,11 @@ eks-ecr-create:
 eks-deploy: eks-push
 	kubectl apply -f k8s/deployment-eks.yaml
 	@echo "Run: kubectl rollout status deployment/vijil-travel-agent -n vijil-sample-agents"
+
+# --- DigitalOcean App Platform ---
+# Build, push to DOCR, deploy, and smoke-test the public sample agent. See deploy/do-deploy.sh.
+do-deploy:
+	./deploy/do-deploy.sh
 
 lint-check:
 	@echo "Running ruff..."
