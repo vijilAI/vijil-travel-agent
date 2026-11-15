@@ -17,6 +17,12 @@ REGISTRY=registry.digitalocean.com/vijil
 [ -z "$(git status --porcelain)" ] || { echo "Working tree is dirty; commit first." >&2; exit 1; }
 export IMAGE_TAG="$(git rev-parse --short HEAD)"
 
+# Preflight: the agent turns a provider error into a polite refusal, so a retired
+# model would still pass the chat smoke test. Check the model exists before building.
+curl -fsS https://api.groq.com/openai/v1/models -H "Authorization: Bearer $GROQ_API_KEY" \
+  | jq -e --arg m "$AGENT_MODEL_ID" 'any(.data[]; .id == $m)' >/dev/null \
+  || { echo "Groq does not serve model '$AGENT_MODEL_ID' for this key." >&2; exit 1; }
+
 doctl registry login --expiry-seconds 1200 >&2
 docker buildx build --platform linux/amd64 --push -t "$REGISTRY/travel-agent:$IMAGE_TAG" . >&2
 
