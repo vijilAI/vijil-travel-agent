@@ -4,13 +4,13 @@
 #
 # Requires: doctl, docker buildx, envsubst, curl, jq.
 # Env: DIGITALOCEAN_ACCESS_TOKEN, GROQ_API_KEY, OPENAI_API_KEY
-#      AGENT_MODEL_ID (default: Llama 4 Maverick on Groq)
+#      AGENT_MODEL_ID (default: llama-3.3-70b-versatile on Groq)
 # Prints the public base URL (ending in /v1) on the last line of stdout.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 : "${DIGITALOCEAN_ACCESS_TOKEN:?}" "${GROQ_API_KEY:?}" "${OPENAI_API_KEY:?}"
-export AGENT_MODEL_ID="${AGENT_MODEL_ID:-meta-llama/llama-4-maverick-17b-128e-instruct}"
+export AGENT_MODEL_ID="${AGENT_MODEL_ID:-llama-3.3-70b-versatile}"
 REGISTRY=registry.digitalocean.com/vijil
 
 # One image per commit, so a certificate can name the exact code it covers.
