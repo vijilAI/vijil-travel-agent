@@ -18,7 +18,7 @@ export AGENT_MODEL_ID="${AGENT_MODEL_ID:-llama-3.3-70b-versatile}"
 REGISTRY=registry.digitalocean.com/vijil
 
 # One image per commit, so a certificate can name the exact code it covers.
-[ -z "$(git status --porcelain)" ] || { echo "Working tree is dirty; commit first." >&2; exit 1; }
+[ -z "$(git status --porcelain -- . ":(exclude).vijil")" ] || { echo "Working tree is dirty; commit first." >&2; exit 1; }
 export IMAGE_TAG="$(git rev-parse --short HEAD)"
 
 # Preflight: the agent turns a provider error into a polite refusal, so a retired
