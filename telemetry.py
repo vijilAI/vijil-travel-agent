@@ -13,11 +13,13 @@ Environment Variables:
 
 import os
 import logging
-from typing import Optional
+from typing import Any, Optional
 
+from openinference.instrumentation.strands_agents import StrandsAgentsToOpenInferenceProcessor
 from opentelemetry import trace, metrics
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource, SERVICE_NAME
@@ -61,9 +63,7 @@ def setup_telemetry(
 
     # Set up tracing
     trace_exporter = OTLPSpanExporter(endpoint=f"{endpoint}/v1/traces")
-    tracer_provider = TracerProvider(resource=resource)
-    tracer_provider.add_span_processor(BatchSpanProcessor(trace_exporter))
-    trace.set_tracer_provider(tracer_provider)
+    trace.set_tracer_provider(build_tracer_provider(resource, trace_exporter))
 
     # Set up metrics
     metric_exporter = OTLPMetricExporter(endpoint=f"{endpoint}/v1/metrics")
@@ -79,6 +79,28 @@ def setup_telemetry(
 
     logger.info("OTEL telemetry setup complete")
     return tracer, meter
+
+
+def build_tracer_provider(resource: Resource, span_exporter: SpanExporter) -> TracerProvider:
+    """Build a tracer provider that exports Strands spans with OpenInference kinds.
+
+    The OpenInference processor rewrites Strands span attributes in place when a
+    span ends, so it is added before the exporting processor; added after, the
+    exporter would ship the spans unconverted.
+    """
+    tracer_provider = TracerProvider(resource=resource)
+    tracer_provider.add_span_processor(StrandsAgentsToOpenInferenceProcessor())
+    tracer_provider.add_span_processor(BatchSpanProcessor(span_exporter))
+    return tracer_provider
+
+
+def instrument_inbound_requests(app: Any, tracer_provider: Optional[trace.TracerProvider] = None) -> None:
+    """Open a server span per request that continues the caller's W3C traceparent.
+
+    Without this, a caller's trace cannot join the agent's spans. The default
+    tracer_provider is the global one that setup_telemetry installs.
+    """
+    FastAPIInstrumentor.instrument_app(app, tracer_provider=tracer_provider)
 
 
 def get_team_id() -> Optional[str]:
