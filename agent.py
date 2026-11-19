@@ -78,6 +78,8 @@ from tools import (
 
 if TYPE_CHECKING:
     from genome_loader import GenomeMutation
+    from opentelemetry.metrics import Meter
+    from opentelemetry.trace import Tracer
 
 # Configure logging
 logging.basicConfig(
@@ -1051,9 +1053,42 @@ def _notify_console_dome_active() -> None:
         logger.warning("Failed to notify console of dome activation", exc_info=True)
 
 
+def configure_telemetry(
+    app: Any, environ: Mapping[str, str]
+) -> tuple["Tracer | None", "Meter | None"]:
+    """Export traces and metrics and trace inbound requests, when OTEL is configured.
+
+    Returns (tracer, meter) once export is set up, or (None, None) when
+    OTEL_EXPORTER_OTLP_ENDPOINT is unset or export setup fails; the agent then
+    serves requests without telemetry.
+    """
+    otel_endpoint = environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+    if not otel_endpoint:
+        return None, None
+    try:
+        from telemetry import instrument_inbound_requests, setup_telemetry
+        tracer, meter = setup_telemetry(otlp_endpoint=otel_endpoint)
+    except ImportError as e:
+        logger.warning(f"OpenTelemetry packages not installed: {e}")
+        return None, None
+    except Exception:
+        logger.warning("Failed to set up telemetry", exc_info=True)
+        return None, None
+    logger.info(f"OTEL telemetry ENABLED: {otel_endpoint}")
+    # Export is already live, so a failure here loses only the caller's trace context.
+    try:
+        instrument_inbound_requests(app)
+    except Exception:
+        logger.warning("Inbound trace context disabled: instrumenting the app failed", exc_info=True)
+    return tracer, meter
+
+
 # =============================================================================
 # Main Entry Point
 # =============================================================================
+
+DEFAULT_PORT = 9000
+
 
 def main():
     """Initialize database and start A2A server."""
@@ -1066,27 +1101,13 @@ def main():
     logger.info("Seed data loaded")
 
     host = "0.0.0.0"
-    port = 9000
+    port = int(os.environ.get("PORT") or DEFAULT_PORT)
 
     # Create concurrent A2A app (FastAPI for both modes)
     app = create_concurrent_a2a_app(create_agent, host, port)
 
-    # Set up telemetry if OTEL endpoint is configured
-    tracer = None
-    meter = None
-    telemetry_enabled = False
-    otel_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
-
-    if otel_endpoint:
-        try:
-            from telemetry import setup_telemetry
-            tracer, meter = setup_telemetry(otlp_endpoint=otel_endpoint)
-            telemetry_enabled = True
-            logger.info(f"OTEL telemetry ENABLED: {otel_endpoint}")
-        except ImportError as e:
-            logger.warning(f"OpenTelemetry packages not installed: {e}")
-        except Exception as e:
-            logger.warning(f"Failed to set up telemetry: {e}")
+    tracer, meter = configure_telemetry(app, os.environ)
+    telemetry_enabled = tracer is not None
 
     # Load genome at startup for dome_config (and initial system_prompt info)
     startup_genome = None
@@ -1190,7 +1211,7 @@ def main():
         print(f"Dome Mode:     {'FAST' if DOME_FAST_MODE else 'FULL'}")
     print(f"Telemetry:     {'ENABLED' if telemetry_enabled else 'DISABLED'}")
     if telemetry_enabled:
-        print(f"OTEL:          {otel_endpoint}")
+        print(f"OTEL:          {os.environ['OTEL_EXPORTER_OTLP_ENDPOINT']}")
     if team_id:
         print(f"Team ID:       {team_id}")
     print("-" * 60)

@@ -103,3 +103,16 @@ def test_instrument_dome_runtime_dependencies_are_declared():
 def test_installed_vijil_dome_satisfies_the_pin():
     req = _requirements_txt()["vijil-dome"]
     assert req.specifier.contains(version("vijil-dome"))
+
+
+def test_telemetry_extra_is_installed_by_the_dockerfile():
+    """The Dockerfile installs requirements.txt only, so it must carry the telemetry extra.
+
+    A package missing from the image makes telemetry.py fail to import, and the agent
+    then runs with telemetry silently disabled.
+    """
+    extra = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["optional-dependencies"]["telemetry"]
+    requirements = _requirements_txt()
+    for req in (Requirement(dep) for dep in extra):
+        assert req.name in requirements, f"{req.name} missing from requirements.txt"
+        assert str(requirements[req.name].specifier) == str(req.specifier)
