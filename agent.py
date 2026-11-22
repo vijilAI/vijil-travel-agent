@@ -33,6 +33,7 @@ import tomllib
 from pathlib import Path
 from enum import StrEnum
 from typing import Any, Callable, Mapping, TYPE_CHECKING
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from starlette.requests import Request
@@ -613,6 +614,11 @@ def _deep_merge(base: dict, overrides: dict) -> dict:
 
 DEFAULT_MODEL_ID = "llama-3.1-8b-instant"
 DEFAULT_MODEL_BASE_URL = "https://api.groq.com/openai/v1"
+DEFAULT_MAX_TOKENS = 4096
+# The OpenAI chat completions range; OpenRouter accepts the same.
+MIN_TEMPERATURE = 0.0
+MAX_TEMPERATURE = 2.0
+OPENROUTER_HOST = "openrouter.ai"
 
 
 class ModelConfigError(ValueError):
@@ -623,17 +629,73 @@ class ModelSettings(BaseModel, frozen=True):
     model_id: str
     base_url: str
     api_key: str | None = Field(default=None, repr=False)
+    temperature: float | None = None
+    provider_order: tuple[str, ...] | None = None
+
+    def request_params(self) -> dict[str, Any]:
+        """Parameters merged into every chat completions request the model makes."""
+        params: dict[str, Any] = {"max_tokens": DEFAULT_MAX_TOKENS}
+        if self.temperature is not None:
+            params["temperature"] = self.temperature
+        if self.provider_order is not None:
+            # OpenRouter's provider routing field is not an OpenAI SDK argument, so it rides in the body.
+            params["extra_body"] = {
+                "provider": {"order": list(self.provider_order), "allow_fallbacks": False}
+            }
+        return params
+
+
+def _resolve_temperature(environ: Mapping[str, str]) -> float | None:
+    """AGENT_TEMPERATURE: unset keeps the provider default; set, it must be a float in range."""
+    raw = environ.get("AGENT_TEMPERATURE")
+    if raw is None:
+        return None
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        raise ModelConfigError(
+            f"AGENT_TEMPERATURE must be a number from {MIN_TEMPERATURE} to {MAX_TEMPERATURE}; "
+            f"got {raw!r}"
+        ) from None
+    if not (MIN_TEMPERATURE <= value <= MAX_TEMPERATURE):  # False for nan, so nan is rejected too
+        raise ModelConfigError(
+            f"AGENT_TEMPERATURE must be from {MIN_TEMPERATURE} to {MAX_TEMPERATURE}; got {raw!r}"
+        )
+    return value
+
+
+def _resolve_provider_order(environ: Mapping[str, str], base_url: str) -> tuple[str, ...] | None:
+    """AGENT_PROVIDER_ORDER: unset lets OpenRouter route freely; set, it pins the providers."""
+    raw = environ.get("AGENT_PROVIDER_ORDER")
+    if raw is None:
+        return None
+    names = tuple(name.strip() for name in raw.split(","))
+    if not all(names):
+        raise ModelConfigError(
+            "AGENT_PROVIDER_ORDER must be comma-separated provider names with no empty name; "
+            f"got {raw!r}"
+        )
+    if urlparse(base_url).hostname != OPENROUTER_HOST:
+        raise ModelConfigError(
+            "AGENT_PROVIDER_ORDER is set but the model is not served through OpenRouter "
+            f"(the AGENT_BASE_URL host is not {OPENROUTER_HOST}); refusing to ignore it"
+        )
+    return names
 
 
 def resolve_model_settings(environ: Mapping[str, str]) -> ModelSettings:
-    """Read the model endpoint, id, and credential from the environment.
+    """Read the model endpoint, id, credential, and sampling settings from the environment.
 
     Unset, empty, or whitespace-only AGENT_BASE_URL / AGENT_MODEL_ID keep the
     Groq defaults. GROQ_API_KEY is used only for the default Groq endpoint; a
     custom AGENT_BASE_URL takes AGENT_API_KEY and never receives the Groq key.
+    AGENT_TEMPERATURE and AGENT_PROVIDER_ORDER are optional; once set, an
+    invalid value is an error, never a silent fallback to the default.
     """
-    base_url = (environ.get("AGENT_BASE_URL") or "").strip()
-    if not base_url:
+    temperature = _resolve_temperature(environ)
+    model_id = (environ.get("AGENT_MODEL_ID") or "").strip() or DEFAULT_MODEL_ID
+    custom_base_url = (environ.get("AGENT_BASE_URL") or "").strip()
+    if not custom_base_url:
         # A None key would let the OpenAI SDK fall back to OPENAI_API_KEY and send it to Groq.
         groq_key = (environ.get("GROQ_API_KEY") or "").strip()
         if not groq_key:
@@ -642,9 +704,11 @@ def resolve_model_settings(environ: Mapping[str, str]) -> ModelSettings:
                 "let the client fall back to another provider's key"
             )
         return ModelSettings(
-            model_id=(environ.get("AGENT_MODEL_ID") or "").strip() or DEFAULT_MODEL_ID,
+            model_id=model_id,
             base_url=DEFAULT_MODEL_BASE_URL,
             api_key=groq_key,
+            temperature=temperature,
+            provider_order=_resolve_provider_order(environ, DEFAULT_MODEL_BASE_URL),
         )
     api_key = (environ.get("AGENT_API_KEY") or "").strip()
     if not api_key:
@@ -653,9 +717,11 @@ def resolve_model_settings(environ: Mapping[str, str]) -> ModelSettings:
             "GROQ_API_KEY to a non-default endpoint"
         )
     return ModelSettings(
-        model_id=(environ.get("AGENT_MODEL_ID") or "").strip() or DEFAULT_MODEL_ID,
-        base_url=base_url,
+        model_id=model_id,
+        base_url=custom_base_url,
         api_key=api_key,
+        temperature=temperature,
+        provider_order=_resolve_provider_order(environ, custom_base_url),
     )
 
 
@@ -800,7 +866,7 @@ def create_agent(messages=None) -> Agent:
                 "base_url": model_settings.base_url,
                 "api_key": model_settings.api_key,
             },
-            params={"max_tokens": 4096},
+            params=model_settings.request_params(),
         ),
         tools=[
             search_flights,

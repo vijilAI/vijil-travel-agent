@@ -194,6 +194,8 @@ For **EKS** (and optional exposure via API Gateway + Lambda with Dome protection
 | `AGENT_BASE_URL` | No | Groq OpenAI-compatible endpoint | Base URL of the model provider |
 | `AGENT_API_KEY` | When `AGENT_BASE_URL` is set | — | API key for the endpoint in `AGENT_BASE_URL`. `GROQ_API_KEY` is sent only to the default Groq endpoint, never to a custom one; startup fails if `AGENT_BASE_URL` is set without this |
 | `AGENT_MODEL_ID` | No | `llama-3.1-8b-instant` | Model id sent to the provider |
+| `AGENT_TEMPERATURE` | No | — (the provider's default) | Sampling temperature for every model call the agent makes, a number from 0 to 2. The `temperature` field of a `/v1/chat/completions` request is ignored, as before. A value that is not a number or is out of range (including an empty value) fails at startup |
+| `AGENT_PROVIDER_ORDER` | No | — (OpenRouter routes freely) | Comma-separated OpenRouter provider names, e.g. `Fireworks,Together`. Every model call sends `provider={"order": [...], "allow_fallbacks": false}`, so a request never goes to a provider outside the list. Requires `AGENT_BASE_URL` on host `openrouter.ai`; an empty name, an empty value, or any other endpoint fails at startup |
 | `VIJIL_CERTIFICATE_JWS` | No | — | Compact JWS published on the A2A agent card as a Vijil extension |
 | `DOME_FAST_MODE` | No | `0` | Set to `1` for fast Dome mode |
 | `OPENAI_API_KEY` | When Dome | — | Required for Dome's LLM-based detectors |
